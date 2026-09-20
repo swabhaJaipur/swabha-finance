@@ -1,0 +1,2377 @@
+import * as CH from '/charts.js';
+const { money, pct, sparkline, colorAt } = CH;
+
+/* ==================================================================== state */
+const S = {
+  user: null, tab: 'overview',
+  // `draft` is what the filter bar shows; `filter` is what the screen is actually using.
+  // They only meet when Apply is pressed, so nothing re-queries while you are still typing.
+  filter: { from: null, to: null, excludeDupes: true },
+  draft:  { from: null, to: null, excludeDupes: true },
+  filtersOpen: false,
+  opts: null, data: null, masters: null, out: null, flags: null, gaps: null,
+  theme: localStorage.getItem('sw-theme') || 'auto',
+};
+const $ = (s, r = document) => r.querySelector(s);
+const app = $('#app');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const fmtDate = d => d ? new Date(d + 'T00:00:00').toLocaleDateString('en-IN',
+  { day: '2-digit', month: 'short', year: '2-digit' }) : '';
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({ error: 'bad response' }));
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+/* ============================================================ filter logic */
+// A chart click calls this. Because every visual reads S.filter, one click
+// re-cuts the entire dashboard — that is the "interlinked" behaviour.
+function addFilter(dim, value) {
+  if (value == null) return;
+  const cur = S.filter[dim];
+  const v = String(value);
+  if (Array.isArray(cur)) { if (!cur.includes(v)) cur.push(v); }
+  else if (cur != null) { if (String(cur) !== v) S.filter[dim] = [String(cur), v]; }
+  else S.filter[dim] = v;
+  S.draft = JSON.parse(JSON.stringify(S.filter));   // keep the bar in step with the click
+  S.filtersOpen = true;
+  refresh();
+}
+const applyDraft = () => { S.filter = JSON.parse(JSON.stringify(S.draft)); refresh(); };
+function resetFilter() {
+  const base = { from: S.opts?.dateRange?.min || null, to: S.opts?.dateRange?.max || null,
+                 excludeDupes: true };
+  S.filter = { ...base };
+  S.draft = { ...base };
+}
+function dropFilter(dim, value) {
+  for (const F of [S.filter, S.draft]) {
+    if (value === undefined || !Array.isArray(F[dim])) delete F[dim];
+    else {
+      F[dim] = F[dim].filter(x => x !== value);
+      if (!F[dim].length) delete F[dim];
+    }
+  }
+  refresh();
+}
+const clearFilters = () => { resetFilter(); refresh(); };
+const activeFilters = () => Object.entries(S.filter)
+  .filter(([k, v]) => !['from','to'].includes(k) && v != null && v !== '' && v !== false)
+  .flatMap(([k, v]) => (Array.isArray(v) ? v : [v]).map(x => ({ dim: k, val: x })));
+
+const DIMLABEL = { books:'View', compliance:'Tax status', account:'Account', month:'Month', quarter:'Quarter', fy:'FY', direction:'Flow', kind:'Kind',
+  cost_behaviour:'Cost type', property:'Property', host:'Host',
+  vendor:'Vendor', employee:'Employee', status:'Status', gst:'GST', source:'Source', search:'Search' };
+
+/* ================================================================= chrome */
+function applyTheme() {
+  document.documentElement.setAttribute('data-theme',
+    S.theme === 'auto' ? '' : S.theme);
+  if (S.theme === 'auto') document.documentElement.removeAttribute('data-theme');
+}
+const MARK = `<svg class="logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+<rect width="100" height="100" rx="22" fill="#fff"/>
+<path d="M50 14c0 0-13 15.5-13 24.5a13 13 0 0 0 26 0C63 29.5 50 14 50 14z" fill="#3FA0D8"/>
+<path d="M45.5 78.5C33 79 20.5 70 18.5 55.5c-1.4-10.2 1-18.5 2.4-22.2.5-1.3 2.2-1.6 3.1-.5C28.5 38 43 51 47 62.7c2 5.9 1.5 12.2-1.5 15.8z" fill="#4CAF50"/>
+<path d="M43 77c-3-9-9.5-18-15.5-23.5" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+<path d="M54.5 78.5C67 79 79.5 70 81.5 55.5c1.4-10.2-1-18.5-2.4-22.2-.5-1.3-2.2-1.6-3.1-.5C71.5 38 57 51 53 62.7c-2 5.9-1.5 12.2 1.5 15.8z" fill="#ED8022"/>
+<path d="M57 77c3-9 9.5-18 15.5-23.5" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/></svg>`;
+
+// screens where the date/party filter actually means something
+const FILTERABLE = new Set(['overview','trends','leaks','billing','profit','laundry',
+                            'outstanding','txns','quality']);
+
+const TABS = [
+  ['overview','Overview'], ['trends','Trends'], ['leaks','Leak Finder'], ['billing','Billing Check'],
+  ['profit','Profitability'], ['staff','Staff'], ['costing','Staff Costing'], ['laundry','Laundry'], ['outstanding','Outstanding'], ['bank','Bank Reconcile'], ['txns','Transactions'],
+  ['entry','Add Entry'], ['fixed','Fixed Monthly'], ['expenses','Expense Heads'], ['loans','Loans'], ['history','Historical Data'], ['whatsapp','WhatsApp Log'], ['assets','Assets'], ['masters','Masters'], ['merge','Merge Duplicates'], ['suspense','Suspense'], ['quality','Data Quality'], ['team','Team'],
+];
+
+function shell() {
+  app.innerHTML = `
+  <div class="topbar">
+    ${MARK}
+    <div class="brandname"><b>Swabha</b><small>FINANCIAL CONTROL</small></div>
+    <nav class="tabs">${TABS.map(([k, n]) =>
+      `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${n}</button>`).join('')}</nav>
+    <div class="sp">
+      <button class="iconbtn" id="assistantBtn" title="Ask a question">💬</button>
+      <button class="iconbtn" id="themeBtn" title="Theme">◐</button>
+      <button class="iconbtn" id="outBtn" title="Sign out">⏻</button>
+    </div>
+  </div>
+  <div class="wrap">
+    <div id="lanbar"></div>
+    <div class="slicers" id="slicers"></div>
+    <div id="view"></div>
+  </div>
+  <div class="assistant-panel" id="assistantPanel" style="display:none">
+    <div class="assistant-header">
+      <h4>💬 Data Assistant</h4>
+      <button class="iconbtn" id="assistantClose">✕</button>
+    </div>
+    <div class="assistant-chat" id="assistantChat"></div>
+    <div class="assistant-input">
+      <input type="text" id="assistantInput" placeholder="Ask about revenue, costs, hosts, laundry, etc…" />
+      <button id="assistantSend">Ask</button>
+    </div>
+  </div>`;
+  app.querySelectorAll('.tabs button').forEach(b =>
+    b.onclick = () => {
+      if (b.dataset.tab === S.tab) return;
+      S.tab = b.dataset.tab;
+      resetFilter();                 // filters belong to a screen, not to the session
+      S.filtersOpen = false;
+      shell(); renderSlicers(); refresh();
+    });
+  $('#themeBtn').onclick = () => {
+    S.theme = S.theme === 'auto' ? 'light' : S.theme === 'light' ? 'dark' : 'auto';
+    localStorage.setItem('sw-theme', S.theme); applyTheme(); render();
+  };
+  $('#outBtn').onclick = async () => { await api('/api/logout', {}); location.reload(); };
+
+  // Assistant setup
+  $('#assistantBtn').onclick = () => {
+    const panel = $('#assistantPanel');
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    if (panel.style.display !== 'none') $('#assistantInput').focus();
+  };
+  $('#assistantClose').onclick = () => $('#assistantPanel').style.display = 'none';
+
+  const askAssistant = async () => {
+    const input = $('#assistantInput');
+    const q = input.value.trim();
+    if (!q) return;
+
+    const chat = $('#assistantChat');
+    chat.innerHTML += `<div class="msg user"><b>You:</b> ${esc(q)}</div>`;
+    input.value = '';
+
+    try {
+      const res = await api('/api/ask', { question: q });
+      const answerHTML = res.answer
+        .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+        .replace(/\n/g, '<br>');
+      chat.innerHTML += `<div class="msg assistant"><b>Assistant:</b><div>${answerHTML}</div></div>`;
+      chat.scrollTop = chat.scrollHeight;
+    } catch (e) {
+      chat.innerHTML += `<div class="msg error"><b>Error:</b> ${esc(e.message)}</div>`;
+    }
+  };
+
+  $('#assistantSend').onclick = askAssistant;
+  $('#assistantInput').addEventListener('keydown', e => { if (e.key === 'Enter') askAssistant(); });
+
+  lanBar();
+}
+
+async function lanBar() {
+  const bar = $('#lanbar'); if (!bar) return;
+  try {
+    const n = await api('/api/net');
+    if (!n.ips.length) return bar.innerHTML = '';
+    const stable = `http://${n.hostname}:${n.port}`;
+    const byIp = `http://${n.ips[0]}:${n.port}`;
+    bar.innerHTML = `<div class="lan">📱 <span>Open on any phone or PC on the same WiFi:
+      <code>${esc(stable)}</code> &nbsp;or&nbsp; <code>${esc(byIp)}</code>
+      <div class="sub">The first address keeps working if the router changes this Mac's IP.</div></span>
+      <button class="btn" id="copyLan" style="padding:3px 10px;font-size:11.5px;margin-left:auto;flex:none">Copy</button></div>`;
+    $('#copyLan').onclick = () => navigator.clipboard?.writeText(stable)
+      .then(() => toast('Address copied'), () => toast(stable));
+  } catch { bar.innerHTML = ''; }
+}
+
+/* ================================================================ slicers */
+function renderSlicers() {
+  const o = S.opts; if (!o) return;
+  const box = $('#slicers');
+  if (!FILTERABLE.has(S.tab)) { box.classList.add('hide'); box.innerHTML = ''; return; }
+  box.classList.remove('hide');
+  const D = S.draft;
+  const active = activeFilters().length + (D.from !== o.dateRange.min || D.to !== o.dateRange.max ? 1 : 0);
+  const sel = (id, label, list, key) => `
+    <div class="fld"><label>${label}</label>
+      <select id="${id}" data-dim="${key}">
+        <option value="">All</option>
+        ${list.map(x => `<option ${String(D[key]) === String(x.key) ? 'selected' : ''}
+          value="${esc(x.key)}">${esc(x.key)}</option>`).join('')}
+      </select></div>`;
+  $('#slicers').innerHTML = `
+    <button class="filter-toggle" id="fToggle" aria-expanded="${S.filtersOpen}">
+      <span>🔎 Filters${active ? ` <b class="fcount">${active}</b>` : ''}</span>
+      <span class="chev">${S.filtersOpen ? '▲' : '▼'}</span>
+    </button>
+    <div class="filter-body ${S.filtersOpen ? '' : 'hide'}">
+      <div class="slicer-row">
+        <div class="fld"><label>Month</label><input type="month" id="fMonth" value="${D.month || ''}"></div>
+        <div class="fld"><label>From</label><input type="date" id="fFrom" value="${D.from || ''}"></div>
+        <div class="fld"><label>To</label><input type="date" id="fTo" value="${D.to || ''}"></div>
+        <div class="fld"><label>Data View</label>
+          <select id="fBooks">
+            <option value="">All money (actual)</option>
+            <option value="tally" ${D.books==='tally'?'selected':''}>In Tally only (tax view)</option>
+            <option value="non_tally" ${D.books==='non_tally'?'selected':''}>Not in Tally only</option>
+          </select></div>
+        ${sel('fHost','Host', o.hosts, 'host')}
+        ${sel('fProp','Property', o.properties, 'property')}
+        ${sel('fVendor','Vendor', o.parties.filter(p => p.kind==='vendor').slice(0, 200), 'vendor')}
+        ${sel('fEmp','Employee', o.employees || [], 'employee')}
+        <div class="fld"><label>Search</label>
+          <input id="fSearch" placeholder="narration, reference, note…" value="${esc(D.search || '')}"></div>
+      </div>
+      <div class="filter-actions">
+        <button class="btn pri" id="fApply">Apply filters</button>
+        <button class="btn" id="fReset">Reset</button>
+        <span class="note">Filters apply to this screen only and reset when you leave it.</span>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>`;
+
+  $('#fToggle').onclick = () => { S.filtersOpen = !S.filtersOpen; renderSlicers(); };
+  const bind = (id, fn) => { const el = $(id); if (el) el.onchange = fn; };
+  bind('#fMonth', e => { if (e.target.value) D.month = e.target.value; else delete D.month; });
+  bind('#fFrom',  e => { D.from = e.target.value || null; });
+  bind('#fTo',    e => { D.to   = e.target.value || null; });
+  bind('#fSearch',e => { const v = e.target.value.trim(); if (v) D.search = v; else delete D.search; });
+  bind('#fBooks', e => { if (e.target.value) D.books = e.target.value; else delete D.books; });
+  $('#slicers').querySelectorAll('select[data-dim]').forEach(el => el.onchange = e => {
+    const d = e.target.dataset.dim;
+    if (e.target.value) D[d] = e.target.value; else delete D[d];
+  });
+  // Enter in any field applies, so the keyboard alone is enough
+  $('#slicers').querySelectorAll('input').forEach(el =>
+    el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); applyDraft(); } }));
+  $('#fApply').onclick = applyDraft;
+  $('#fReset').onclick = () => { resetFilter(); refresh(); };
+  renderChips();
+}
+
+function renderChips() {
+  const f = activeFilters(), box = $('#chips'); if (!box) return;
+  const quick = [
+    ...(S.dupeCount ? [['excludeDupes', `Hide ${S.dupeCount} flagged duplicates`]] : []),
+    ...(S.flags?.length ? [['flaggedOnly', 'Only flagged']] : []),
+    ['unattributed', 'Unattributed only'], ['needsReview', 'Needs review'],
+  ];
+  const booksLabel = { tally: 'In Tally only (tax view)', non_tally: 'Not in Tally only' }[S.filter.books];
+  box.innerHTML = (booksLabel ? `<span class="chip" style="background:var(--warn-bg);border-color:var(--saffron)">
+      <b>${esc(booksLabel)}</b><button class="x" data-d="books" data-v="">×</button></span>` : '')
+    + f.map(x => `<span class="chip">${DIMLABEL[x.dim] || x.dim}: <b>${esc(x.val)}</b>
+        <button class="x" data-d="${x.dim}" data-v="${esc(x.val)}">×</button></span>`).join('')
+    + quick.map(([k, n]) => `<button class="chip" data-toggle="${k}"
+        style="${S.filter[k] ? 'background:var(--warn-bg);border-color:var(--saffron)' : ''}">${n}</button>`).join('')
+    + (f.length ? `<button class="clear" id="clr">clear all</button>` : '');
+  box.querySelectorAll('.x').forEach(b => b.onclick = () => dropFilter(b.dataset.d, b.dataset.v || undefined));
+  box.querySelectorAll('[data-toggle]').forEach(b => b.onclick = () => {
+    const k = b.dataset.toggle;
+    if (S.filter[k]) { delete S.filter[k]; delete S.draft[k]; }
+    else { S.filter[k] = true; S.draft[k] = true; }
+    refresh();
+  });
+  if ($('#clr')) $('#clr').onclick = clearFilters;
+}
+
+/* ================================================================== cards */
+function card(title, hint, bodyHTML, drill) {
+  const id = 'c' + Math.random().toString(36).slice(2, 8);
+  return `<section class="card">
+    <header><h3>${title}</h3>${hint ? `<span class="hint">${hint}</span>` : ''}
+      ${drill ? `<button class="expand" data-drill='${esc(JSON.stringify(drill))}' title="Expand and drill down">⤢</button>` : ''}
+    </header>
+    <div class="body" id="${id}">${bodyHTML || ''}</div></section>`;
+}
+function wire(root) {
+  root.querySelectorAll('[data-drill]').forEach(b =>
+    b.onclick = () => openDrill(JSON.parse(b.dataset.drill)));
+}
+const kpi = (label, value, sub, cls = '') =>
+  `<div class="kpi ${cls}"><h4>${label}</h4><div class="v">${value}</div>
+   ${sub ? `<div class="s">${sub}</div>` : ''}</div>`;
+
+/* ================================================================= drill  */
+// Expand any visual, then keep clicking: each level narrows the filter and
+// moves to the next dimension. The last level is always the real entries.
+const CHAIN = ['month','category','party','property','host','voucher_type','payment_mode','source'];
+const CHART_KINDS = [
+  ['bar','Bars'], ['line','Line'], ['donut','Share'], ['tree','Treemap'], ['pareto','80/20'], ['rank','Ranked'],
+];
+
+// Expand any card. The chart is redrawn large; clicking a mark narrows the selection and
+// the table underneath always shows the real entries behind whatever is on screen.
+async function openDrill(cfg) {
+  const path = [];
+  let dim = cfg.dim || 'category';
+  let kind = cfg.chart || 'rank';
+  let measure = cfg.field || 'gross';
+  const base = { ...JSON.parse(JSON.stringify(S.filter)), ...(cfg.filter || {}) };
+
+  const host = document.createElement('div');
+  host.className = 'modal';
+  host.innerHTML = `<div class="sheet drill-sheet">
+    <header>${MARK}<h3 id="dTitle">${esc(cfg.title || 'Detail')}</h3>
+      <button class="btn" id="dApply" title="Use this selection as the screen filter">Apply to screen</button>
+      <button class="btn" id="dClose">Close</button></header>
+    <div class="body">
+      <div class="drill" id="dPath"></div>
+      <div class="drill-controls">
+        <div class="ctl"><span class="ctl-lbl">Group by</span><span id="dDim"></span></div>
+        <div class="ctl"><span class="ctl-lbl">Chart</span><span id="dKind"></span></div>
+        <div class="ctl"><span class="ctl-lbl">Measure</span>
+          <select id="dMeasure">
+            <option value="gross">Total value</option>
+            <option value="money_in">Money in</option>
+            <option value="money_out">Money out</option>
+            <option value="revenue">Revenue</option>
+            <option value="opcost">Cost</option>
+            <option value="net_operating">Net</option>
+            <option value="txns">Number of entries</option>
+          </select></div>
+      </div>
+      <div id="dChart" class="drill-chart"></div>
+      <div id="dSum" class="drill-sum"></div>
+      <div id="dTable"></div>
+    </div></div>`;
+  document.body.append(host);
+  const close = () => { host.remove(); document.removeEventListener('keydown', esckey); };
+  const esckey = e => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', esckey);
+  host.onclick = e => { if (e.target === host) close(); };
+  $('#dClose', host).onclick = close;
+  $('#dApply', host).onclick = () => { for (const pth of path) addFilter(pth.dim, pth.val); close(); };
+  $('#dMeasure', host).value = measure;
+  $('#dMeasure', host).onchange = e => { measure = e.target.value; draw(); };
+
+  const curFilter = () => {
+    const f = JSON.parse(JSON.stringify(base));
+    for (const pth of path) f[pth.dim] = pth.val;
+    return f;
+  };
+
+  async function draw() {
+    $('#dPath', host).innerHTML =
+      `<button data-i="-1">All</button>` +
+      path.map((pth, i) => `<span class="sep">›</span><button data-i="${i}">${esc(pth.val)}</button>`).join('') +
+      `<span class="sep">›</span><span class="by">by ${DIMLABEL[dim] || dim}</span>`;
+    $('#dPath', host).querySelectorAll('button').forEach(b => b.onclick = () => {
+      path.length = Math.max(0, +b.dataset.i + 1);
+      draw();
+    });
+    $('#dDim', host).innerHTML = CHAIN.map(dd =>
+      `<button class="pill ${dd === dim ? 'on' : ''}" data-d="${dd}">${DIMLABEL[dd] || dd}</button>`).join('');
+    $('#dDim', host).querySelectorAll('[data-d]').forEach(b =>
+      b.onclick = () => { dim = b.dataset.d; draw(); });
+    $('#dKind', host).innerHTML = CHART_KINDS.map(([k, n]) =>
+      `<button class="pill ${k === kind ? 'on' : ''}" data-k="${k}">${n}</button>`).join('');
+    $('#dKind', host).querySelectorAll('[data-k]').forEach(b =>
+      b.onclick = () => { kind = b.dataset.k; draw(); });
+
+    const f = curFilter();
+    const rows = await api('/api/breakdown', { filter: f, dim, limit: 40 });
+    const ch = $('#dChart', host);
+    ch.innerHTML = '';
+    const pick = (k) => {                       // clicking a mark descends a level
+      path.push({ dim, val: k });
+      const next = CHAIN.find(dd => !path.some(pp => pp.dim === dd));
+      if (next) dim = next;
+      draw();
+    };
+    const opt = { field: measure, height: 320, onClick: pick };
+    if (!rows.length) ch.innerHTML = '<div class="empty">Nothing matches this selection</div>';
+    else if (kind === 'bar')    CH.groupedBars(ch, rows, { ...opt, keys: [
+        { f: 'money_in', c: 'var(--in)', n: 'In' }, { f: 'money_out', c: 'var(--out)', n: 'Out' }] });
+    else if (kind === 'line')   CH.lineChart(ch, rows, opt);
+    else if (kind === 'donut')  CH.donut(ch, rows, { ...opt, centreLabel: DIMLABEL[dim] });
+    else if (kind === 'tree')   CH.treemap(ch, rows, opt);
+    else if (kind === 'pareto') CH.pareto(ch, rows, { ...opt, limit: 15 });
+    else                        CH.rankBars(ch, rows.slice(0, 20), opt);
+
+    const e = await api('/api/entries', { filter: f, paging: { limit: 300 } });
+    $('#dSum', host).innerHTML = `<b>${e.total}</b> entries behind this selection ·
+      <b>${money(e.sum, true)}</b> total${e.total > 300 ? ' · showing first 300' : ''}`;
+    $('#dTable', host).innerHTML = entriesTable(e.rows);
+    wireEntryRows($('#dTable', host), async () => { await draw(); refresh(); });
+  }
+  draw();
+}
+
+/* =============================================================== entries  */
+function entriesTable(rows, allowBulk = true) {
+  if (!rows.length) return '<div class="empty">No entries</div>';
+  const bulkUI = allowBulk ? `
+    <div style="padding:10px;background:var(--chip);border-radius:8px;margin-bottom:10px;display:flex;gap:10px;align-items:center">
+      <label style="font-size:12px"><input type="checkbox" id="bulkSelectAll"> Select all (${rows.length})</label>
+      <span id="bulkCount" style="color:var(--muted);font-size:12px"></span>
+      <div style="flex:1"></div>
+      <select id="bulkAction" style="padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);font-size:12px">
+        <option value="">Bulk actions…</option>
+        <option value="category">Set category for selected</option>
+        <option value="property">Set property for selected</option>
+        <option value="status">Mark as Posted/Cleared</option>
+      </select>
+      <button id="bulkApply" class="btn" style="padding:6px 12px;font-size:12px">Apply</button>
+    </div>
+  ` : '';
+
+  return `<div>${bulkUI}<div style="max-height:52vh;overflow:auto"><table><thead><tr>
+    ${allowBulk ? '<th style="width:30px"><input type="checkbox" class="bulkCheck" data-all="1"></th>' : ''}
+    <th>Date</th><th>Voucher</th><th>Party</th><th>Category</th><th>Property</th>
+    <th class="num">Amount</th><th class="num">GST</th><th>Source</th><th></th><th></th></tr></thead><tbody>
+    ${rows.map(r => `<tr class="click" data-txn="${r.txn_id}">
+      ${allowBulk ? `<td style="width:30px"><input type="checkbox" class="bulkCheck" data-txn="${r.txn_id}" style="cursor:pointer"></td>` : ''}
+      <td class="mono">${fmtDate(r.txn_date)}</td>
+      <td class="mono">${esc(r.voucher_no || '—')}</td>
+      <td>${esc(r.party || '—')}</td>
+      <td><span class="tag ${r.kind === 'revenue' ? 'rev' : r.kind === 'capex' ? 'cap' : 'cost'}">${esc(r.category || '—')}</span></td>
+      <td>${esc(r.property || '<span style="color:var(--muted-2)">unattributed</span>')}</td>
+      <td class="num ${r.direction === 'in' ? 'in' : 'out'}">${r.direction === 'in' ? '+' : '−'}${money(r.gross_amount, true).replace('₹','₹')}</td>
+      <td class="num">${r.gst ? money(r.gst) : '—'}</td>
+      <td><span class="tag ${r.source === 'Tally' ? 'tally' : 'manual'}">${esc(r.source || '?')}</span></td>
+      <td>${r.flags ? `<span class="tag flag">⚑ ${r.flags}</span>` : ''}</td>
+      <td><button class="btn rowedit" data-txn="${r.txn_id}"
+            style="padding:2px 9px;font-size:11.5px">Edit</button></td>
+    </tr>`).join('')}</tbody></table></div></div>`;
+}
+// `redraw` lets a drill-down rebuild itself after an edit, instead of only the page behind it
+function wireEntryRows(root, redraw) {
+  root.querySelectorAll('tr[data-txn]').forEach(tr =>
+    tr.onclick = e => { if (e.target.closest('button') || e.target.closest('input')) return; openTxn(+tr.dataset.txn, redraw); });
+  root.querySelectorAll('button.rowedit').forEach(b =>
+    b.onclick = e => { e.stopPropagation(); openTxn(+b.dataset.txn, redraw); });
+
+  // Bulk operations
+  const selectAll = root.querySelector('input[data-all]');
+  const checks = root.querySelectorAll('input.bulkCheck:not([data-all])');
+  const bulkCount = root.querySelector('#bulkCount');
+  const updateCount = () => {
+    const cnt = Array.from(checks).filter(c => c.checked).length;
+    bulkCount.textContent = cnt ? `${cnt} selected` : '';
+    if (selectAll) selectAll.checked = cnt === checks.length && checks.length > 0;
+  };
+
+  if (selectAll) selectAll.onclick = e => {
+    e.stopPropagation();
+    const checked = selectAll.checked;
+    checks.forEach(c => c.checked = checked);
+    updateCount();
+  };
+
+  checks.forEach(c => {
+    c.onclick = e => { e.stopPropagation(); updateCount(); };
+  });
+
+  const bulkAction = root.querySelector('#bulkAction');
+  const bulkApply = root.querySelector('#bulkApply');
+
+  if (bulkApply) {
+    bulkApply.onclick = async () => {
+      const action = bulkAction?.value;
+      const txns = Array.from(checks).filter(c => c.checked).map(c => +c.dataset.txn);
+      if (!txns.length || !action) { toast('Select entries and an action'); return; }
+
+      if (action === 'category') {
+        const cats = S.opts.categories.map(c => c.key);
+        const cat = prompt('Category:', 'Unclassified');
+        if (!cat || !cats.includes(cat)) return;
+        try {
+          await api('/api/txn/bulk', { txns, action: 'set_category', value: cat });
+          toast(`${txns.length} entries updated`);
+          redraw();
+        } catch (e) { toast(e.message, true); }
+      } else if (action === 'property') {
+        const props = S.opts.properties.map(p => p.key);
+        const prop = prompt('Property:', '');
+        if (prop && !props.includes(prop)) { toast('Invalid property'); return; }
+        try {
+          await api('/api/txn/bulk', { txns, action: 'set_property', value: prop || null });
+          toast(`${txns.length} entries updated`);
+          redraw();
+        } catch (e) { toast(e.message, true); }
+      } else if (action === 'status') {
+        const status = confirm('Mark as Posted? (Cancel for Cleared)') ? 'Posted' : 'Cleared';
+        try {
+          await api('/api/txn/bulk', { txns, action: 'set_status', value: status });
+          toast(`${txns.length} entries ${status}`);
+          redraw();
+        } catch (e) { toast(e.message, true); }
+      }
+    };
+  }
+}
+
+/* ========================================================= txn detail/edit */
+let MODAL_DEPTH = 0;
+async function openTxn(id, onSaved) {
+  let d;
+  try { d = await api('/api/txn/detail', { txn_id: id }); }
+  catch (e) { toast('Could not open entry: ' + e.message, true); return; }
+  const t = d.txn;
+  const cats = S.opts.categories.map(c => c.key);
+  const host = document.createElement('div');
+  host.className = 'modal';
+  host.style.zIndex = String(100 + (++MODAL_DEPTH) * 10);   // always above whatever opened it
+  const f = (l, name, val, type = 'text', extra = '') =>
+    `<div class="fld"><label>${l}</label><input name="${name}" type="${type}" value="${esc(val ?? '')}" ${extra}></div>`;
+  host.innerHTML = `<div class="sheet" style="max-width:760px"><header>${MARK}
+      <h3>Entry ${esc(t.voucher_no || '#' + t.txn_id)}</h3>
+      <span class="tag ${t.source === 'Tally' ? 'tally' : 'manual'}">${esc(t.source)}</span>
+      <button class="btn" id="xClose">Close</button></header>
+    <div class="body">
+      ${d.flags.filter(x => !x.resolved).map(x =>
+        `<div class="banner warn">⚑ <b>${esc(x.flag_type)}</b> — ${esc(x.message)}
+         <button class="btn" data-flag="${x.flag_id}" style="padding:3px 9px;margin-left:8px">Mark resolved</button></div>`).join('')}
+      <form id="xForm" class="form">
+        ${f('Date','txn_date', t.txn_date,'date')}
+        ${f('Voucher no','voucher_no', t.voucher_no)}
+        <div class="fld"><label>Category</label><select name="category">
+          ${cats.map(c => `<option ${c === d.txn.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+        </select></div>
+        <div class="fld"><label>Direction</label><select name="direction">
+          <option value="in" ${t.direction === 'in' ? 'selected' : ''}>Money in</option>
+          <option value="out" ${t.direction === 'out' ? 'selected' : ''}>Money out</option></select></div>
+        ${f('Amount (gross)','gross_amount', t.gross_amount,'number','step=0.01')}
+        ${f('Taxable value','taxable_value', t.taxable_value,'number','step=0.01')}
+        ${f('CGST','cgst', t.cgst,'number','step=0.01')}
+        ${f('SGST','sgst', t.sgst,'number','step=0.01')}
+        ${f('IGST','igst', t.igst,'number','step=0.01')}
+        <div class="fld"><label>Property</label><select name="property_id">
+          <option value="">— unattributed —</option>
+          ${(S.masters?.properties || []).map(p =>
+            `<option value="${p.property_id}" ${p.property_id === t.property_id ? 'selected' : ''}>
+              ${esc(p.property_id)} · ${esc(p.name)}</option>`).join('')}
+        </select></div>
+        ${f('Paid by','payment_mode', t.payment_mode)}
+        <div class="fld full"><label>Note</label><input name="narration" value="${esc(t.narration ?? '')}"></div>
+      </form>
+      <div class="note" style="margin-top:12px">Every change is written to the audit log with your name,
+        the old value and the new value. The original Tally figure is never lost.</div>
+      ${d.history.length ? `<div style="margin-top:12px"><b style="font-size:12px">Change history</b>
+        <table style="margin-top:6px"><tbody>${d.history.slice(0, 12).map(h =>
+          `<tr><td class="mono">${esc(h.ts)}</td><td>${esc(h.actor)}</td><td>${esc(h.field || h.action)}</td>
+           <td class="mono">${esc(h.old_value ?? '')} → ${esc(h.new_value ?? '')}</td></tr>`).join('')}
+        </tbody></table></div>` : ''}
+    </div>
+    <footer><button class="btn" id="xCancel">Cancel</button>
+      <button class="btn pri" id="xSave">Save changes</button></footer></div>`;
+  document.body.append(host);
+  const close = () => { host.remove(); MODAL_DEPTH = Math.max(0, MODAL_DEPTH - 1); };
+  host.onclick = e => { if (e.target === host) close(); };
+  host.addEventListener('keydown', e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
+  $('#xClose', host).onclick = close; $('#xCancel', host).onclick = close;
+  host.querySelectorAll('[data-flag]').forEach(b => b.onclick = async () => {
+    await api('/api/flag/resolve', { flag_id: +b.dataset.flag });
+    b.closest('.banner').remove(); loadAux();
+  });
+  $('#xSave', host).onclick = async () => {
+    const fd = new FormData($('#xForm', host));
+    const changes = {};
+    for (const [k, v] of fd.entries()) changes[k] = v === '' ? null : v;
+    try {
+      const r = await api('/api/txn/update', { txn_id: id, changes });
+      close();
+      toast(r.updated ? `Saved — ${r.updated} field${r.updated > 1 ? 's' : ''} changed` : 'No changes to save');
+      if (typeof onSaved === 'function') await onSaved();   // redraw the drill-down behind it
+      else refresh();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+function toast(msg, bad) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = `position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:200;
+    background:${bad ? 'var(--out)' : 'var(--ink)'};color:var(--panel);padding:10px 18px;border-radius:10px;
+    font-weight:600;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.28)`;
+  document.body.append(t); setTimeout(() => t.remove(), 2600);
+}
+
+/* ================================================================== views */
+const V = {};
+
+V.overview = () => {
+  const k = S.data.kpis, g = S.gaps;
+  const v = $('#view');
+  v.innerHTML = `
+    ${S.dupeCount > 0 ? `<div class="banner bad">
+      <b>${S.dupeCount} entries are flagged as possible duplicates.</b>
+      They were imported on purpose so nothing was lost, but they would double-count if included.
+      The dashboard is currently <b>${S.filter.excludeDupes ? 'HIDING' : 'INCLUDING'}</b> them —
+      toggle "Hide flagged duplicates" in the filter bar. Settle them in
+      <b>Data Quality</b> or <b>Bank Reconcile</b>.</div>` : ''}
+    ${g.revenueUnattributedPct > 50 ? `<div class="banner warn">
+      <b>${g.revenueUnattributedPct.toFixed(0)}% of revenue (${money(g.revenueUnattributed, true)})
+      cannot be traced to a property.</b> Per-property profit stays blank until parties are mapped —
+      go to <b>Masters → Party mapping</b>. ${g.partiesUnmapped} of ${g.partiesTotal} parties are unmapped.</div>` : ''}
+    <div class="kpis">
+      ${kpi('Revenue', money(k.revenue), `${k.txns} entries in range`, 'in')}
+      ${kpi('Operating cost', money(k.opcost), 'purchases + overheads', 'out')}
+      ${kpi('Net operating', money(k.net_operating), `${k.margin.toFixed(1)}% margin`,
+            k.net_operating >= 0 ? 'in' : 'out')}
+      ${kpi('Uncollected', money(S.out.total), `${S.out.count} customers owe you`, 'warn')}
+      ${kpi('GST in period', money(k.gst), 'collected + paid')}
+      ${kpi('Open data flags', String(g.openFlags), 'need a decision', g.openFlags ? 'warn' : '')}
+    </div>
+    <div class="grid">
+      ${card('Profit bridge', 'where the money goes', '<div id="oWf"></div>',
+             { dim:'category', title:'Profit bridge' })}
+      ${card('Revenue vs cost by month', 'click a bar to filter', '<div id="oBars"></div>',
+             { dim:'month', title:'Monthly detail' })}
+      ${card('Net operating trend', '', '<div id="oLine"></div>', { dim:'month', title:'Net by month' })}
+    </div>
+    <div style="margin:16px 0"><h3>💼 Profitability by Host</h3></div>
+    <div class="grid" id="oHostGrid"></div>
+    <div class="grid">
+      ${card('Where revenue comes from', 'top parties', '<div id="oParty"></div>',
+             { dim:'party', title:'Revenue by party', filter:{ direction:'in' } })}
+      ${card('Cost composition', '', '<div id="oCost"></div>',
+             { dim:'category', title:'Cost detail', filter:{ direction:'out' } })}
+      ${card('Money in vs out', '', '<div id="oFlow"></div>', { dim:'direction', title:'Flow' })}
+    </div>`;
+  const rev = k.revenue, cogs = k.cogs, opex = k.opex;
+  CH.waterfall($('#oWf'), [
+    { label:'Revenue', value: rev },
+    { label:'Purchases', value: -cogs },
+    ...(opex ? [{ label:'Overheads', value: -opex }] : []),
+    { label:'Net operating', total: true },
+  ], { onClick: m => m.label === 'Revenue' ? addFilter('direction','in') : addFilter('direction','out') });
+  CH.groupedBars($('#oBars'), S.data.series, { onClick: m => addFilter('month', m) });
+  CH.lineChart($('#oLine'), S.data.series, { field:'net_operating', onClick: m => addFilter('month', m) });
+
+  // Populate host profitability cards
+  const hostBreakdown = S.data.breakdowns.host || [];
+  const hostGrid = $('#oHostGrid');
+  hostGrid.innerHTML = hostBreakdown.slice(0, 12).map(h => `
+    <div style="padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--bg-card)">
+      <h4 style="margin:0 0 8px 0;font-size:14px">${esc(h.key)}</h4>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
+        <div><span style="color:var(--muted)">Revenue:</span> <b style="color:var(--in)">${money(h.money_in, true)}</b></div>
+        <div><span style="color:var(--muted)">Cost:</span> <b style="color:var(--out)">${money(h.opcost, true)}</b></div>
+        <div><span style="color:var(--muted)">Net:</span> <b style="color:${h.net_operating >= 0 ? 'var(--in)' : 'var(--out)'}">${money(h.net_operating || 0, true)}</b></div>
+        <div><span style="color:var(--muted)">Margin:</span> <b>${h.money_in ? (100 * (h.net_operating || 0) / h.money_in).toFixed(1) : 0}%</b></div>
+      </div>
+      <button class="btn" style="width:100%;margin-top:8px;padding:4px;font-size:11px" onclick="addFilter('host','${esc(h.key)}')">View details</button>
+    </div>
+  `).join('');
+
+  CH.rankBars($('#oParty'), (S.data.breakdowns.party || []).filter(r => r.money_in > 0).slice(0, 8),
+    { field:'money_in', onClick: p => addFilter('party', p) });
+  CH.donut($('#oCost'), (S.data.breakdowns.category || []).filter(r => r.opcost > 0),
+    { field:'opcost', onClick: c => addFilter('category', c), centreLabel:'cost' });
+  CH.treemap($('#oFlow'), S.data.breakdowns.category || [], { onClick: c => addFilter('category', c) });
+  wire(v);
+};
+
+V.trends = () => {
+  const v = $('#view'), s = S.data.series;
+  let run = 0;
+  const cum = s.map(r => ({ ...r, cumulative: (run += r.net_operating) }));
+  v.innerHTML = `
+    <div class="grid">
+      ${card('Revenue and margin', 'bars = revenue, line = margin %', '<div id="tCombo"></div>',
+             { dim:'month', title:'Month detail' })}
+      ${card('Cumulative net operating', 'the real trajectory', '<div id="tCum"></div>',
+             { dim:'month', title:'Month detail' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Month by month', 'click any row to drill into that month', '<div id="tTable"></div>', { dim:'month', title:'Month by month', chart:'bar' })}
+    </div>`;
+  CH.comboChart($('#tCombo'), s, { barField:'revenue', lineField:'margin',
+    barName:'Revenue', lineName:'Margin %', onClick: m => addFilter('month', m) });
+  CH.lineChart($('#tCum'), cum, { field:'cumulative', color:'var(--leaf)',
+    onClick: m => addFilter('month', m) });
+  const spark = s.map(r => r.net_operating);
+  $('#tTable').innerHTML = `<table><thead><tr><th>Month</th><th class="num">Revenue</th>
+    <th class="num">Cost</th><th class="num">Net</th><th class="num">Margin</th>
+    <th class="num">GST</th><th class="num">Entries</th><th>Trend</th></tr></thead><tbody>
+    ${s.map((r, i) => `<tr class="click" data-m="${esc(r.key)}">
+      <td><b>${esc(r.key)}</b></td>
+      <td class="num in">${money(r.revenue, true)}</td>
+      <td class="num out">${money(r.opcost, true)}</td>
+      <td class="num ${r.net_operating >= 0 ? 'in' : 'out'}">${money(r.net_operating, true)}</td>
+      <td class="num">${(r.revenue ? pct(r.net_operating, r.revenue) : 0).toFixed(1)}%</td>
+      <td class="num">${money(r.gst)}</td>
+      <td class="num">${r.txns}</td>
+      <td>${sparkline(spark.slice(0, i + 1), { color: r.net_operating >= 0 ? 'var(--leaf)' : 'var(--out)' })}</td>
+    </tr>`).join('')}</tbody></table>`;
+  $('#tTable').querySelectorAll('[data-m]').forEach(tr =>
+    tr.onclick = () => addFilter('month', tr.dataset.m));
+  wire(v);
+};
+
+V.leaks = () => {
+  const v = $('#view');
+  v.innerHTML = `
+    <div class="banner ok">This tab exists to answer one question: <b>where is money leaking?</b>
+      The Pareto shows the few vendors that make up most of your spend. The heatmap shows months where a
+      cost jumped. Duplicates are entries that look posted twice.</div>
+    <div class="grid one">
+      ${card('80/20 of spend', 'the bars left of the 80% line are where your money actually goes',
+             '<div id="lPareto"></div>', { dim:'party', title:'Spend by vendor', filter:{ direction:'out' } })}
+    </div>
+    <div class="grid" style="margin-top:12px">
+      ${card('Spend heatmap', 'month × category — look for a row that suddenly darkens',
+             '<div id="lHeat"></div>', { dim:'category', title:'Spend heatmap', chart:'tree', field:'money_out', filter:{direction:'out'} })}
+      ${card('Cost concentration', '', '<div id="lTree"></div>',
+             { dim:'party', title:'Vendors', filter:{ direction:'out' } })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card(`Suspicious entries (${S.flags.length})`, 'duplicates, GST mismatches, unattributed',
+             '<div id="lFlags"></div>', { dim:'party', title:'Flagged entries', chart:'rank', filter:{flaggedOnly:true} })}
+    </div>`;
+  const vendors = (S.data.breakdowns.party || []).filter(r => r.money_out > 0);
+  CH.pareto($('#lPareto'), vendors, { field:'money_out', limit: 12,
+    onClick: p => addFilter('party', p) });
+  CH.treemap($('#lTree'), vendors.slice(0, 14), { field:'money_out',
+    onClick: p => addFilter('party', p) });
+  (async () => {
+    const rows = await api('/api/breakdown', { filter: { ...S.filter, direction:'out' }, dim:'category', limit: 12 });
+    const months = S.data.series.map(r => r.key);
+    const cells = {};
+    for (const c of rows) {
+      for (const m of months) cells[c.key + '|' + m] = 0;
+    }
+    const per = await Promise.all(rows.map(c =>
+      api('/api/breakdown', { filter: { ...S.filter, direction:'out', category: c.key }, dim:'month', limit: 40 })
+        .then(ms => [c.key, ms])));
+    for (const [cat, ms] of per) for (const m of ms) cells[cat + '|' + m.key] = m.money_out;
+    CH.heatmap($('#lHeat'), { rows: rows.map(r => r.key), cols: months,
+      get: (r, c) => cells[r + '|' + c] }, { onClick: (r) => addFilter('category', r) });
+  })();
+  $('#lFlags').innerHTML = S.flags.length ? `<table><thead><tr><th>Severity</th><th>Issue</th>
+    <th>Date</th><th>Party</th><th class="num">Amount</th><th>Detail</th></tr></thead><tbody>
+    ${S.flags.slice(0, 60).map(f => `<tr class="click" data-txn="${f.txn_id}">
+      <td><span class="tag ${f.severity === 'high' ? 'cost' : 'flag'}">${esc(f.severity)}</span></td>
+      <td><b>${esc(f.flag_type.replace(/_/g, ' '))}</b></td>
+      <td class="mono">${fmtDate(f.txn_date)}</td>
+      <td>${esc(f.party)}</td>
+      <td class="num">${money(f.gross_amount, true)}</td>
+      <td style="color:var(--muted)">${esc(f.message)}</td></tr>`).join('')}</tbody></table>`
+    : '<div class="empty">No open flags</div>';
+  wireEntryRows($('#lFlags'));
+  wire(v);
+};
+
+V.profit = () => {
+  const v = $('#view'), g = S.gaps;
+  v.innerHTML = `
+    ${g.propertiesNoRate ? `<div class="banner warn">
+      <b>${g.propertiesNoRate} of ${g.propertiesTotal} properties have no billing rate</b> and
+      <b>${g.cleanersNoRate} of ${g.cleanersTotal} cleaners have no pay rate.</b>
+      Per-property profit cannot be calculated until these exist — the numbers aren't in any file you have.
+      Enter them in <b>Masters</b>.</div>` : ''}
+    <div class="grid one">
+      ${card('Profit map', 'each bubble is a party — above the dotted line you make money, below it you lose',
+             '<div id="pScatter"></div>', { dim:'party', title:'Profit map', chart:'rank', field:'net_operating' })}
+    </div>
+    <div class="grid" style="margin-top:12px">
+      ${card('Most profitable parties', 'revenue minus what you spend with them', '<div id="pTop"></div>',
+             { dim:'party', title:'Party detail' })}
+      ${card('Revenue by property', 'only what is mapped', '<div id="pProp"></div>',
+             { dim:'property', title:'Property detail' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Party ledger', 'click any row for its entries', '<div id="pTable"></div>', { dim:'party', title:'Party ledger', chart:'rank' })}
+    </div>`;
+  const parties = (S.data.breakdowns.party || []);
+  CH.scatter($('#pScatter'), parties.filter(p => p.money_in || p.money_out).slice(0, 40).map(p => ({
+    label: p.key, x: p.money_out, y: p.money_in, r: p.txns })),
+    { xName:'You paid them', yName:'They paid you', onClick: p => addFilter('party', p.label) });
+  CH.rankBars($('#pTop'), [...parties].map(p => ({ ...p, net: p.money_in - p.money_out }))
+    .sort((a, b) => b.net - a.net).slice(0, 8), { field:'net', color:'var(--leaf)',
+    onClick: p => addFilter('party', p) });
+  CH.rankBars($('#pProp'), (S.data.breakdowns.property || []).slice(0, 8),
+    { field:'money_in', onClick: p => addFilter('property', p) });
+  $('#pTable').innerHTML = `<table><thead><tr><th>Party</th><th class="num">They paid you</th>
+    <th class="num">You paid them</th><th class="num">Net</th><th class="num">Entries</th></tr></thead><tbody>
+    ${parties.slice(0, 40).map(p => `<tr class="click" data-p="${esc(p.key)}">
+      <td><b>${esc(p.key)}</b></td>
+      <td class="num in">${p.money_in ? money(p.money_in, true) : '—'}</td>
+      <td class="num out">${p.money_out ? money(p.money_out, true) : '—'}</td>
+      <td class="num ${p.money_in - p.money_out >= 0 ? 'in' : 'out'}">${money(p.money_in - p.money_out, true)}</td>
+      <td class="num">${p.txns}</td></tr>`).join('')}</tbody></table>`;
+  $('#pTable').querySelectorAll('[data-p]').forEach(tr =>
+    tr.onclick = () => addFilter('party', tr.dataset.p));
+  wire(v);
+};
+
+V.outstanding = () => {
+  const v = $('#view'), o = S.out;
+  v.innerHTML = `
+    <div class="kpis">
+      ${kpi('Total uncollected', money(o.total, true), `${o.count} customers`, 'warn')}
+      ${kpi('Largest single debt', money(o.rows[0]?.balance || 0, true), esc(o.rows[0]?.party || '—'), 'out')}
+      ${kpi('Average owed', money(o.count ? o.total / o.count : 0, true), 'per customer')}
+    </div>
+    <div class="grid">
+      ${card('Who owes you most', 'click to see their entries', '<div id="uBars"></div>', { dim:'party', title:'Who owes you most', chart:'rank', field:'money_in' })}
+      ${card('Share of receivables', '', '<div id="uDonut"></div>', { dim:'party', title:'Share of receivables', chart:'donut', field:'money_in' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Receivables ledger', '', '<div id="uTable"></div>', { dim:'party', title:'Receivables ledger', chart:'rank' })}
+    </div>`;
+  const rows = o.rows.map(r => ({ key: r.party, gross: r.balance, txns: 1, ...r }));
+  CH.rankBars($('#uBars'), rows.slice(0, 10), { field:'balance', color:'var(--saffron)',
+    onClick: p => addFilter('party', p) });
+  CH.donut($('#uDonut'), rows.slice(0, 8), { field:'balance', centreLabel:'owed',
+    onClick: p => addFilter('party', p) });
+  $('#uTable').innerHTML = `<table><thead><tr><th>Customer</th><th>Period</th>
+    <th class="num">Cleaning</th><th class="num">Laundry</th><th class="num">Billed</th>
+    <th class="num">Received</th><th class="num">Still owed</th><th>Last entry</th></tr></thead><tbody>
+    ${o.rows.map(r => `<tr class="click" data-p="${esc(r.party)}">
+      <td><b>${esc(r.party)}</b></td><td class="mono">${esc(r.period || '')}</td>
+      <td class="num">${r.cleaning ? money(r.cleaning, true) : '—'}</td>
+      <td class="num">${r.laundry ? money(r.laundry, true) : '—'}</td>
+      <td class="num">${money(r.total, true)}</td>
+      <td class="num in">${r.received ? money(r.received, true) : '—'}</td>
+      <td class="num out"><b>${money(r.balance, true)}</b></td>
+      <td class="mono">${fmtDate(r.last_txn)}</td></tr>`).join('')}</tbody></table>`;
+  $('#uTable').querySelectorAll('[data-p]').forEach(tr =>
+    tr.onclick = () => { if (tr.dataset.p !== '(unmatched)') addFilter('party', tr.dataset.p); });
+  wire(v);
+};
+
+V.txns = async () => {
+  const v = $('#view');
+  v.innerHTML = `<div class="grid one">${card('All entries', 'click any row to view or correct it',
+    '<div id="xList"><div class="empty">Loading…</div></div>')}</div>`;
+  const e = await api('/api/entries', { filter: S.filter, paging: { limit: 500 } });
+  $('#xList').innerHTML = `<div class="sub" style="margin-bottom:8px"><b>${e.total}</b> entries match ·
+    ${money(e.sum, true)} total ${e.total > 500 ? '· showing first 500' : ''}</div>` + entriesTable(e.rows);
+  wireEntryRows($('#xList'));
+  wire(v);
+};
+
+V.entry = () => {
+  const v = $('#view');
+  const cats = S.opts.categories;
+  v.innerHTML = `<div class="grid one">${card('Post a new entry',
+    'goes straight into the live database — everyone on the network sees it immediately', `
+    <form id="eForm" class="form">
+      <div class="fld"><label>Date *</label><input name="txn_date" type="date" required
+        value="${new Date().toISOString().slice(0,10)}"></div>
+      <div class="fld"><label>Money in or out *</label><select name="direction">
+        <option value="in">Money in (received)</option>
+        <option value="out" selected>Money out (paid)</option></select></div>
+      <div class="fld"><label>Amount *</label><input name="gross_amount" type="number" step="0.01" required placeholder="0.00"></div>
+      <div class="fld"><label>Category *</label><select name="category">
+        ${cats.map(c => `<option value="${esc(c.key)}">${esc(c.key)} — ${esc(c.kind)}</option>`).join('')}
+      </select></div>
+      <div class="fld"><label>Party</label><input name="party" list="partyList" placeholder="customer or vendor"></div>
+      <datalist id="partyList">${S.opts.parties.map(p => `<option value="${esc(p.key)}">`).join('')}</datalist>
+      <div class="fld"><label>Property</label><select name="property_id">
+        <option value="">— none —</option>
+        ${(S.masters?.properties || []).map(p =>
+          `<option value="${p.property_id}">${esc(p.property_id)} · ${esc(p.name)}</option>`).join('')}
+      </select></div>
+      <div class="fld"><label>Paid by</label><select name="payment_mode">
+        <option value="">—</option><option>Bank Transfer</option><option>UPI</option>
+        <option>Cash</option><option>Cheque</option><option>Card</option></select></div>
+      <div class="fld"><label>Voucher no</label><input name="voucher_no" placeholder="optional"></div>
+      <div class="fld"><label>CGST</label><input name="cgst" type="number" step="0.01" value="0"></div>
+      <div class="fld"><label>SGST</label><input name="sgst" type="number" step="0.01" value="0"></div>
+      <div class="fld full"><label>Note</label><input name="narration" placeholder="what was this for?"></div>
+      <div class="full"><button class="btn pri" type="submit">Post entry</button>
+        <span class="note" style="margin-left:10px">Saved as source <b>Manual</b> so it is never confused with Tally data.</span></div>
+    </form>`)}</div>`;
+  $('#eForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    try {
+      await api('/api/txn/create', b);
+      toast('Entry posted'); ev.target.reset();
+      $('#eForm [name=txn_date]').value = new Date().toISOString().slice(0,10);
+      refresh();
+    } catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.history = () => {
+  const v = $('#view');
+  v.innerHTML = `<div class="grid one">${card('Add historical data that is not in Tally',
+    'cash payments, WhatsApp-logged transfers, old books', `
+    <div class="banner warn">Everything added here is stamped with a <b>source</b> and your reason,
+      so Tally-backed figures and added figures can always be told apart — you can view the dashboard
+      either way using the <b>Source</b> filter. This is exactly what the old spreadsheet got wrong:
+      ₹13.6L of entries appeared with no label and no explanation.</div>
+    <form id="hForm">
+      <div class="form">
+        <div class="fld"><label>Source name *</label>
+          <input name="source" value="WhatsApp Log" placeholder="e.g. WhatsApp Log, Cash Book 2025"></div>
+        <div class="fld"><label>Reason / what this is *</label>
+          <input name="reason" required placeholder="e.g. cash payments logged by Ritesh, not in Tally"></div>
+      </div>
+      <div style="margin-top:12px"><label style="font-size:10.5px;font-weight:700;letter-spacing:.5px;
+        text-transform:uppercase;color:var(--muted)">Paste rows — one per line</label>
+        <div class="note" style="margin:4px 0 6px">Format:
+          <code>date, in/out, amount, category, party, note</code> —
+          e.g. <code>2026-08-14, out, 4500, Cleaner Wages, Amit Choudhary, August cash payment</code><br>
+          Dates accept <code>2026-08-14</code> or <code>14/08/2026</code>. Unknown parties are created.</div>
+        <textarea name="rows" rows="12" placeholder="2026-08-14, out, 4500, Cleaner Wages, Amit Choudhary, August cash
+2026-08-15, in, 12000, Service Revenue, Pinkcity BnB, UPI received"></textarea></div>
+      <div style="margin-top:12px"><button class="btn pri" type="submit">Preview and import</button></div>
+    </form>
+    <div id="hResult" style="margin-top:14px"></div>`)}</div>`;
+  $('#hForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const parsed = [], bad = [];
+    String(fd.get('rows')).split('\n').map(l => l.trim()).filter(Boolean).forEach((line, i) => {
+      const p = line.split(',').map(x => x.trim());
+      if (p.length < 3) return bad.push({ i: i + 1, line, why: 'need at least date, in/out, amount' });
+      let d = p[0];
+      const m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(d);
+      if (m) d = `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return bad.push({ i: i + 1, line, why: 'bad date' });
+      const dir = /^in|rec|cr/i.test(p[1]) ? 'in' : 'out';
+      const amt = Number(String(p[2]).replace(/[^\d.-]/g, ''));
+      if (!amt) return bad.push({ i: i + 1, line, why: 'bad amount' });
+      parsed.push({ txn_date: d, direction: dir, gross_amount: amt,
+        category: p[3] || (dir === 'in' ? 'Service Revenue' : 'Unclassified'),
+        party: p[4] || null, create_party: true, narration: p[5] || null, needs_review: 1 });
+    });
+    const res = $('#hResult');
+    if (!parsed.length) { res.innerHTML = `<div class="banner bad">Nothing valid to import.</div>`; return; }
+    try {
+      const r = await api('/api/txn/bulk', { rows: parsed, source: fd.get('source'), reason: fd.get('reason') });
+      res.innerHTML = `<div class="banner ok"><b>Imported ${r.inserted} entries</b> as source
+        “${esc(r.source)}”. They are marked <b>needs review</b> so you can check them.</div>`
+        + (bad.length ? `<div class="banner bad"><b>${bad.length} lines skipped:</b><br>${
+            bad.slice(0, 12).map(b => `line ${b.i}: ${esc(b.why)} — <code>${esc(b.line.slice(0, 60))}</code>`).join('<br>')}</div>` : '');
+      ev.target.rows.value = ''; refresh();
+    } catch (e) { res.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+  };
+  wire(v);
+};
+
+V.fixed = async () => {
+  const v = $('#view');
+  const month = S.fixedMonth || (new Date().toISOString().slice(0, 7));
+  const d = await api('/api/recurring?month=' + month);
+  S.fixedMonth = d.month;
+  const inc = d.rows.filter(r => r.direction === 'in');
+  const exp = d.rows.filter(r => r.direction === 'out');
+  const t = d.totals;
+  const netDue = t.income_due - t.expense_due;
+
+  v.innerHTML = `
+    <div class="banner ok">Fixed monthly income and costs roll forward on their own. Nothing reaches the
+      ledger until you press <b>Post</b> for that month — so the books never gain money you did not approve.
+      Change an amount, skip one month, or stop an item and the history is kept.</div>
+    <div class="card" style="margin-bottom:12px"><header>
+      <button class="btn" id="mPrev">← ${esc(d.prev)}</button>
+      <h3 style="text-align:center">${esc(d.month)}</h3>
+      <button class="btn" id="mNext">${esc(d.next)} →</button></header>
+      <div class="body">
+        <div class="kpis" style="margin:0">
+          ${kpi('Fixed income due', money(t.income_due, true), `${d.due.filter(r=>r.direction==='in').length} lines`, 'in')}
+          ${kpi('Fixed costs due', money(t.expense_due, true), `${d.due.filter(r=>r.direction==='out').length} lines`, 'out')}
+          ${kpi('Net if posted', money(netDue, true), netDue >= 0 ? 'adds to profit' : 'reduces profit', netDue >= 0 ? 'in' : 'out')}
+          ${kpi('Already posted', money(t.income_posted - t.expense_posted, true), 'net, this month')}
+        </div>
+        ${d.due.length ? `<div style="margin-top:12px">
+          <button class="btn pri" id="postAll">Post all ${d.due.length} items for ${esc(d.month)}</button>
+          <span class="note" style="margin-left:10px">creates ${d.due.length} ledger entries marked source <b>Recurring</b></span>
+        </div>` : '<div class="note" style="margin-top:12px">Nothing left to post for this month.</div>'}
+      </div></div>
+
+    <div class="grid">
+      ${card(`Fixed monthly income (${inc.length})`, 'packages, retainers', recTable(inc, d.month, 'in'))}
+      ${card(`Fixed monthly costs (${exp.length})`, 'rent, salaries, subscriptions', recTable(exp, d.month, 'out'))}
+    </div>
+
+    <div class="grid one" style="margin-top:12px">
+      ${card('Add a fixed monthly item', '', `
+        <form id="rForm" class="form">
+          <div class="fld"><label>Name *</label><input name="name" required placeholder="e.g. Office rent"></div>
+          <div class="fld"><label>Income or cost *</label><select name="direction">
+            <option value="out">Fixed cost (money out)</option>
+            <option value="in">Fixed income (money in)</option></select></div>
+          <div class="fld"><label>Amount per month *</label><input name="amount" type="number" step="0.01" required></div>
+          <div class="fld"><label>Category</label><select name="category">
+            ${S.opts.categories.map(c => `<option value="${esc(c.key)}">${esc(c.key)} — ${esc(c.kind)}</option>`).join('')}
+          </select></div>
+          <div class="fld"><label>Day of month</label><input name="day_of_month" type="number" min="1" max="31" value="1"></div>
+          <div class="fld"><label>GST rate %</label><select name="gst_rate">
+            <option value="0">No GST</option><option value="18">18% (inclusive)</option>
+            <option value="5">5%</option><option value="12">12%</option></select></div>
+          <div class="fld"><label>Party</label><input name="party" list="partyList2" placeholder="optional"></div>
+          <datalist id="partyList2">${S.opts.parties.map(p => `<option value="${esc(p.key)}">`).join('')}</datalist>
+          <div class="fld"><label>Property</label><select name="property_id"><option value="">— none —</option>
+            ${(S.masters?.properties || []).map(p => `<option value="${p.property_id}">${esc(p.property_id)} · ${esc(p.name)}</option>`).join('')}
+          </select></div>
+          <div class="fld"><label>Starts from</label><input name="start_month" type="month" value="${esc(d.month)}"></div>
+          <div class="fld full"><label>Note</label><input name="notes"></div>
+          <div class="full"><button class="btn pri" type="submit">Add</button>
+            <button class="btn" type="button" id="genPkg" style="margin-left:8px">Generate income lines from property packages</button>
+            <span class="note" style="margin-left:8px">needs rates in Masters first</span></div>
+        </form>`)}
+    </div>`;
+
+  $('#mPrev').onclick = () => { S.fixedMonth = d.prev; render(); };
+  $('#mNext').onclick = () => { S.fixedMonth = d.next; render(); };
+  if ($('#postAll')) $('#postAll').onclick = async () => {
+    if (!confirm(`Post ${d.due.length} fixed items for ${d.month} into the ledger?`)) return;
+    const r = await api('/api/recurring/post', { month: d.month });
+    toast(`Posted ${r.posted} entries for ${d.month}`); refresh();
+  };
+  $('#genPkg').onclick = async () => {
+    const r = await api('/api/recurring/generate', {});
+    toast(r.created ? `Created ${r.created} monthly income lines` :
+      `Nothing to create — ${r.eligible} properties have a rate, ${r.skipped} already have a line`, !r.created);
+    loadAux(); render();
+  };
+  $('#rForm').onsubmit = async ev => {
+    ev.preventDefault();
+    try { await api('/api/recurring/save', Object.fromEntries(new FormData(ev.target).entries()));
+      toast('Added'); ev.target.reset(); render(); }
+    catch (e) { toast(e.message, true); }
+  };
+  v.querySelectorAll('[data-rec-act]').forEach(b => b.onclick = async () => {
+    const rec_id = +b.dataset.rec, act = b.dataset.recAct;
+    let amount = null, note = null;
+    if (act === 'change') {
+      const x = prompt(`New monthly amount from ${d.month} onward:`, b.dataset.amt);
+      if (x === null) return; amount = Number(x);
+      if (!isFinite(amount)) return toast('Not a number', true);
+      note = prompt('Why did it change? (optional)') || null;
+    }
+    if (act === 'stop' && !confirm(`Stop this item from ${d.month} onward?`)) return;
+    if (act === 'skip' && !confirm(`Skip this item for ${d.month} only?`)) return;
+    await api('/api/recurring/change', { rec_id, month: d.month, action: act, amount, note });
+    toast('Updated'); render();
+  });
+  v.querySelectorAll('[data-rec-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this fixed item completely? Past posted entries stay in the ledger.')) return;
+    await api('/api/recurring/delete', { rec_id: +b.dataset.recDel });
+    toast('Deleted'); render();
+  });
+  wire(v);
+};
+
+function recTable(rows, month, dir) {
+  if (!rows.length) return `<div class="empty">No fixed ${dir === 'in' ? 'income' : 'costs'} set up yet</div>`;
+  return `<div style="max-height:44vh;overflow:auto"><table><thead><tr>
+    <th>Item</th><th class="num">This month</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+    ${rows.map(r => `<tr>
+      <td><b>${esc(r.name)}</b>
+        <div class="sub">${esc(r.category || '')}${r.property_name ? ' · ' + esc(r.property_name) : ''}${r.gst_rate ? ' · GST ' + r.gst_rate + '%' : ''}</div></td>
+      <td class="num ${dir === 'in' ? 'in' : 'out'}">${r.effective ? money(r.effective, true) : '—'}
+        ${r.effective !== r.amount && r.effective ? `<div class="sub">was ${money(r.amount)}</div>` : ''}</td>
+      <td>${r.posted_txn ? '<span class="tag rev">posted</span>'
+            : r.why ? `<span class="tag">${esc(r.why)}</span>`
+            : '<span class="tag flag">due</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-rec="${r.rec_id}" data-amt="${r.amount}" data-rec-act="change">Change</button>
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-rec="${r.rec_id}" data-rec-act="skip">Skip</button>
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-rec="${r.rec_id}" data-rec-act="stop">Stop</button>
+        <button class="btn danger" style="padding:3px 8px;font-size:11.5px" data-rec-del="${r.rec_id}">×</button>
+      </td></tr>`).join('')}</tbody></table></div>`;
+}
+
+V.whatsapp = () => {
+  const v = $('#view');
+  v.innerHTML = `
+    <div class="banner ok">Export the payment thread from WhatsApp
+      (<b>chat → ⋮ → More → Export chat → Without media</b>), open the .txt and paste it below.
+      Nothing is imported until you review it — a chat message is evidence of a payment, not a ledger entry.</div>
+    <div class="grid one">
+      ${card('Paste the exported WhatsApp chat', 'Ritesh / owner payment log', `
+        <form id="wForm">
+          <div class="form">
+            <div class="fld"><label>Date order in the export</label><select name="dateOrder">
+              <option value="dmy">Day/Month/Year (Indian — usual)</option>
+              <option value="mdy">Month/Day/Year (US)</option></select></div>
+            <div class="fld"><label>Source name</label><input name="source" value="WhatsApp Log"></div>
+          </div>
+          <textarea name="text" rows="10" style="margin-top:10px"
+            placeholder="[13/08/2026, 10:23:45] Ritesh: Received 12,500 from Pinkcity BnB"></textarea>
+          <div style="margin-top:10px"><button class="btn pri" type="submit">Read the chat</button></div>
+        </form>
+        <div id="wOut" style="margin-top:14px"></div>`)}
+    </div>`;
+  $('#wForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const out = $('#wOut');
+    out.innerHTML = '<div class="empty">Reading…</div>';
+    try {
+      const r = await api('/api/whatsapp/parse',
+        { text: fd.get('text'), dateOrder: fd.get('dateOrder') });
+      S.wa = r; S.waSource = fd.get('source');
+      const su = r.summary;
+      out.innerHTML = `
+        <div class="kpis">
+          ${kpi('Messages read', String(r.messages), su.date_range ? su.date_range.join(' → ') : '')}
+          ${kpi('Payments found', String(su.total), `${su.clear} clear, ${su.needs_review} need a look`)}
+          ${kpi('Money in', money(su.money_in, true), 'per the chat', 'in')}
+          ${kpi('Money out', money(su.money_out, true), 'per the chat', 'out')}
+          ${kpi('Already in ledger', String(su.already_in_ledger || 0), 'likely the GST ones from Tally', 'warn')}
+        </div>
+        <div class="note" style="margin:8px 0">People in this chat: <b>${su.senders.map(esc).join(', ')}</b>.
+          Untick anything that is already in Tally or is not a real payment, fix the direction, then import.</div>
+        <div style="max-height:52vh;overflow:auto"><table><thead><tr>
+          <th><input type="checkbox" id="wAll" checked></th><th>Date</th><th>In/Out</th>
+          <th class="num">Amount</th><th>Matched to</th><th>Message</th><th>Check</th></tr></thead><tbody>
+          ${r.proposals.map((x, i) => `<tr>
+            <td><input type="checkbox" class="wPick" data-i="${i}"
+                 ${x.already_in_ledger || x.duplicate_in_chat ? '' : 'checked'}></td>
+            <td class="mono">${esc(x.date)}</td>
+            <td><select class="wDir" data-i="${i}" style="padding:3px;border:1px solid var(--line);border-radius:5px;background:var(--bg)">
+              <option value="in" ${x.direction === 'in' ? 'selected' : ''}>In</option>
+              <option value="out" ${x.direction === 'out' ? 'selected' : ''}>Out</option></select></td>
+            <td class="num"><b>${money(x.amount, true)}</b>
+              ${x.all_amounts.length > 1 ? `<div class="sub">also saw ${x.all_amounts.filter(a => a !== x.amount).map(a => money(a)).join(', ')}</div>` : ''}</td>
+            <td>${x.match ? `${esc(x.match)} <span class="tag">${esc(x.match_kind)}</span>` : '<span style="color:var(--muted-2)">—</span>'}</td>
+            <td style="max-width:280px;color:var(--muted);font-size:11.5px">${esc(x.text.slice(0, 110))}</td>
+            <td>${x.already_in_ledger ? '<span class="tag tally">in Tally</span>'
+                 : x.duplicate_in_chat ? '<span class="tag flag">repeat</span>'
+                 : x.reason ? `<span class="tag flag">${esc(x.reason)}</span>` : '<span class="tag rev">clear</span>'}</td>
+          </tr>`).join('')}</tbody></table></div>
+        <div style="margin-top:12px">
+          <input id="wReason" placeholder="Reason for this import (required)" value="payments logged on WhatsApp, not in Tally"
+            style="width:min(460px,100%);padding:8px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
+          <button class="btn pri" id="wImport" style="margin-left:8px">Import ticked rows</button></div>`;
+      $('#wAll').onchange = e =>
+        out.querySelectorAll('.wPick').forEach(c => c.checked = e.target.checked);
+      $('#wImport').onclick = async () => {
+        const reason = $('#wReason').value.trim();
+        if (!reason) return toast('A reason is required', true);
+        const picks = [...out.querySelectorAll('.wPick:checked')].map(c => +c.dataset.i);
+        if (!picks.length) return toast('Nothing ticked', true);
+        const rows = picks.map(i => {
+          const x = S.wa.proposals[i];
+          const dir = out.querySelector(`.wDir[data-i="${i}"]`).value;
+          return { txn_date: x.date, direction: dir, gross_amount: x.amount,
+            category: dir === 'in' ? 'Service Revenue' : 'Unclassified',
+            party: x.match_kind === 'party' ? x.match : null, create_party: false,
+            property_id: x.property_id || null,
+            narration: `WhatsApp ${x.sender}: ${x.text.slice(0, 150)}`, needs_review: 1 };
+        });
+        try {
+          const res = await api('/api/txn/bulk', { rows, source: S.waSource || 'WhatsApp Log', reason });
+          toast(`Imported ${res.inserted} payments`);
+          out.innerHTML = `<div class="banner ok"><b>${res.inserted} payments imported</b> as source
+            “${esc(S.waSource)}”, all marked <b>needs review</b>. They now show in every chart —
+            use the <b>Source</b> filter to compare Tally-only against everything.</div>`;
+          refresh();
+        } catch (e) { toast(e.message, true); }
+      };
+    } catch (e) { out.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+  };
+  wire(v);
+};
+
+V.laundry = async () => {
+  const v = $('#view');
+  const d = await api('/api/laundry');
+  const t = d.totals;
+  v.innerHTML = `
+    ${d.byMonth.length < 6 ? `<div class="banner warn">Laundry detail exists for only
+      <b>${d.byMonth.length} months</b> (${d.byMonth.map(m => m.key).join(', ')}) — that is how far the
+      per-service split in your Tally management summary goes. Later months record revenue as one
+      lump, so laundry cannot be separated for them yet.</div>` : ''}
+    <div class="kpis">
+      ${kpi('Laundry revenue', money(t.laundry, true), `${t.laundry_share.toFixed(1)}% of service revenue`, 'in')}
+      ${kpi('Housekeeping revenue', money(t.housekeeping, true), 'cleaning side', 'in')}
+      ${kpi('Attach rate', t.attach_rate.toFixed(0) + '%', `${t.takers} of ${t.takers + t.non_takers} customers take laundry`, 'cap')}
+      ${kpi('Laundry not collected', money(t.laundry_owed, true), 'billed, unpaid', 'warn')}
+      ${kpi('Customers without laundry', String(t.non_takers), 'the upsell list', 'warn')}
+    </div>
+    <div class="grid">
+      ${card('Laundry vs housekeeping', 'share of service revenue', '<div id="lqMix"></div>', { dim:'category', title:'Laundry vs housekeeping', chart:'donut' })}
+      ${card('Month by month', 'both service lines', '<div id="lqMonth"></div>', { dim:'month', title:'Laundry month by month', chart:'bar' })}
+      ${card('Service mix from Tally line items', 'all recorded services', '<div id="lqLines"></div>')}
+      ${card('Biggest laundry customers', '', '<div id="lqTop"></div>', { dim:'party', title:'Biggest laundry customers', chart:'rank', field:'money_in' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Laundry attach — who takes it, who does not',
+             'bubbles below the line buy cleaning but little or no laundry', '<div id="lqScatter"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Laundry by customer', 'click a row to filter the rest of the dashboard to that customer',
+             '<div id="lqTable"></div>', { dim:'party', title:'Laundry by customer', chart:'rank' })}
+    </div>`;
+
+  CH.donut($('#lqMix'), [
+    { key: 'Laundry', gross: t.laundry, txns: 0 },
+    { key: 'Housekeeping', gross: t.housekeeping, txns: 0 }],
+    { centreLabel: 'service revenue' });
+  CH.groupedBars($('#lqMonth'), d.byMonth, {
+    keys: [{ f: 'laundry', c: 'var(--water)', n: 'Laundry' },
+           { f: 'housekeeping', c: 'var(--leaf)', n: 'Housekeeping' }],
+    onClick: m => addFilter('month', m) });
+  CH.rankBars($('#lqLines'), d.lines, { field: 'gross' });
+  CH.rankBars($('#lqTop'), d.byParty.filter(p => p.laundry > 0).slice(0, 10),
+    { field: 'laundry', color: 'var(--water)', onClick: k => addFilter('party', k) });
+  CH.scatter($('#lqScatter'), d.byParty.filter(p => p.total > 0).slice(0, 40).map(p => ({
+      label: p.key, x: p.housekeeping, y: p.laundry, r: p.total })),
+    { xName: 'Housekeeping billed', yName: 'Laundry billed',
+      onClick: p => addFilter('party', p.label) });
+
+  $('#lqTable').innerHTML = `<div style="max-height:48vh;overflow:auto"><table><thead><tr>
+    <th>Customer</th><th class="num">Housekeeping</th><th class="num">Laundry</th>
+    <th class="num">Laundry share</th><th class="num">Total billed</th><th></th></tr></thead><tbody>
+    ${d.byParty.map(p => {
+      const share = p.total ? (p.laundry / p.total) * 100 : 0;
+      return `<tr class="click" data-p="${esc(p.key)}">
+        <td><b>${esc(p.key)}</b></td>
+        <td class="num">${p.housekeeping ? money(p.housekeeping, true) : '—'}</td>
+        <td class="num ${p.laundry ? 'in' : ''}">${p.laundry ? money(p.laundry, true) : '—'}</td>
+        <td class="num">${share.toFixed(0)}%<div class="bar-mini"><i style="width:${share.toFixed(0)}%"></i></div></td>
+        <td class="num">${money(p.total, true)}</td>
+        <td>${p.laundry ? '' : '<span class="tag flag">no laundry — upsell</span>'}</td></tr>`;
+    }).join('')}</tbody></table></div>`;
+  $('#lqTable').querySelectorAll('[data-p]').forEach(tr =>
+    tr.onclick = () => addFilter('party', tr.dataset.p));
+  wire(v);
+};
+
+V.billing = async () => {
+  const v = $('#view');
+  const d = await api('/api/billing-gap?from=2025-12&to=2026-06');
+  const t = d.totals;
+  const open = d.rows.filter(r => r.status === 'under-billed');
+  const settled = d.rows.filter(r => r.status === 'settled');
+  const shortfall = open.reduce((a, r) => a + (r.gap || 0), 0);
+  v.innerHTML = `
+    <div class="banner warn">This compares <b>work recorded in the daily log</b> against
+      <b>what Tally actually invoiced</b>, for Dec 2025 – Jun 2026 where both exist.
+      A gap is not automatically lost money — it is usually money that came in outside Tally.
+      Settle each row and it stops appearing.</div>
+    <div class="kpis">
+      ${kpi('Work logged', money(t.expected, true), 'valued at your rate card', 'cap')}
+      ${kpi('Tally invoiced', money(t.billed, true), 'same customers, same months')}
+      ${kpi('Unsettled shortfall', money(shortfall, true), `${open.length} rows to settle`, shortfall > 0 ? 'warn' : 'in')}
+      ${kpi('Already settled', String(settled.length), 'rows you have dealt with', 'in')}
+    </div>
+    <div class="grid">
+      ${card('Shortfall by customer', 'click a bar to filter the dashboard', '<div id="bgBars"></div>', { dim:'party', title:'Shortfall by customer', chart:'rank' })}
+      ${card('Logged vs invoiced', '', '<div id="bgCmp"></div>', { dim:'party', title:'Logged vs invoiced', chart:'bar' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card(`Rows to settle (${open.length})`, 'three ways to close each one', '<div id="bgTable"></div>')}
+    </div>
+    ${settled.length ? `<div class="grid one" style="margin-top:12px">
+      ${card(`Settled (${settled.length})`, '', `<table><thead><tr><th>Customer</th><th>Month</th>
+        <th>How it was settled</th><th>Note</th></tr></thead><tbody>
+        ${settled.map(r => `<tr><td>${esc(r.party_name)}</td><td class="mono">${esc(r.month)}</td>
+          <td><span class="tag rev">${esc(String(r.resolution).replace(/_/g,' '))}</span></td>
+          <td style="color:var(--muted)">${esc(r.resolution_note || '')}</td></tr>`).join('')}
+        </tbody></table>`)}</div>` : ''}`;
+
+  const byP = d.byParty.filter(p => p.matched && p.gap > 0);
+  CH.rankBars($('#bgBars'), byP.map(p => ({ key: p.key, gross: p.gap, txns: p.months })),
+    { field: 'gross', color: 'var(--saffron)', onClick: k => addFilter('party', k) });
+  CH.groupedBars($('#bgCmp'), byP.slice(0, 8).map(p => ({ key: p.key, revenue: p.expected,
+      opcost: p.billed, txns: p.months })),
+    { keys: [{ f: 'revenue', c: 'var(--water)', n: 'Logged' },
+             { f: 'opcost', c: 'var(--leaf)', n: 'Invoiced' }],
+      onClick: k => addFilter('party', k) });
+
+  $('#bgTable').innerHTML = open.length ? `<div style="max-height:52vh;overflow:auto">
+    <table><thead><tr><th>Customer</th><th>Month</th><th class="num">Visits</th><th class="num">Pieces</th>
+    <th class="num">Logged value</th><th class="num">Invoiced</th><th class="num">Short by</th>
+    <th>Settle as…</th></tr></thead><tbody>
+    ${open.map((r, i) => `<tr>
+      <td><b>${esc(r.party_name)}</b></td><td class="mono">${esc(r.month)}</td>
+      <td class="num">${r.visits ? Math.round(r.visits) : '—'}</td>
+      <td class="num">${r.pieces ? Math.round(r.pieces) : '—'}</td>
+      <td class="num">${money(r.expected_gross, true)}</td>
+      <td class="num">${money(r.billed || 0, true)}</td>
+      <td class="num out"><b>${money(r.gap, true)}</b></td>
+      <td style="white-space:nowrap">
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-act="outside_tally"
+          data-p="${esc(r.party_name)}" data-m="${esc(r.month)}" data-a="${Math.round(r.gap)}"
+          title="Money did come in, just not through Tally">Received outside Tally</button>
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-act="to_invoice"
+          data-p="${esc(r.party_name)}" data-m="${esc(r.month)}" data-a="${Math.round(r.gap)}"
+          title="Never billed — add to the chase list">Still to invoice</button>
+        <button class="btn" style="padding:3px 8px;font-size:11.5px" data-act="rate_fixed"
+          data-p="${esc(r.party_name)}" data-m="${esc(r.month)}" data-a="0"
+          title="My rate card is wrong for this customer">Rate is wrong</button>
+      </td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">Nothing left to settle</div>';
+
+  $('#bgTable').querySelectorAll('[data-act]').forEach(b => b.onclick = async () => {
+    const act = b.dataset.act, party = b.dataset.p, month = b.dataset.m;
+    let amount = Number(b.dataset.a), note = null;
+    if (act === 'rate_fixed') {
+      note = prompt(`What is the correct rate for ${party}? (this is recorded as a note; set the rate in Masters → Rate Card)`);
+      if (note === null) return;
+      amount = 0;
+    } else {
+      const x = prompt(`${act === 'outside_tally' ? 'Amount received outside Tally' : 'Amount still to invoice'} for ${party}, ${month}:`, amount);
+      if (x === null) return;
+      amount = Number(x);
+      if (!(amount > 0)) return toast('Enter an amount', true);
+      note = prompt('Note (optional)') || null;
+    }
+    try {
+      await api('/api/billing-gap/resolve', { party_name: party, month, action: act, amount, note });
+      toast(act === 'outside_tally' ? 'Recorded as non-GST revenue'
+          : act === 'to_invoice' ? 'Added to the chase list' : 'Noted');
+      render();
+    } catch (e) { toast(e.message, true); }
+  });
+  wire(v);
+};
+
+V.costing = async () => {
+  const v = $('#view');
+  const month = S.costMonth || '2026-06';
+  const d = await api('/api/costing?month=' + month);
+  const c = d.config;
+  const pool = c.pools[0] || {};
+  v.innerHTML = `
+    <div class="banner warn">Staff cost is built in two stages. First the guest house, food,
+      electricity and the cook are pooled and shared across the people who live there — that gives
+      each person's <b>real</b> cost. Then that cost is charged to customers by the visits actually
+      logged for them. Tell it which spend feeds the pool and who lives there, and both stages fill in.</div>
+    <div class="card" style="margin-bottom:12px"><header>
+      <button class="btn" id="cPrev">←</button><h3 style="text-align:center">${esc(d.month)}</h3>
+      <button class="btn" id="cNext">→</button></header>
+      <div class="body"><div class="kpis" style="margin:0">
+        ${kpi('Salary + PF/ESIC', money(d.staff.reduce((a,r)=>a+r.base_cost,0), true), `${d.staff.length} current staff`, 'out')}
+        ${kpi('Guest house pool', money(d.pools.reduce((a,p)=>a+p.total,0), true), `${pool.users||0} people assigned`, 'out')}
+        ${kpi('Fully loaded cost', money(d.total_loaded, true), 'what staff really cost', 'out')}
+        ${kpi('Cost per visit', money(d.per_visit, true), `${Math.round(d.total_visits)} visits logged`, 'warn')}
+      </div></div></div>
+    <div class="grid">
+      ${card('What feeds the guest house pool', 'rent, electricity, groceries, the cook', '<div id="cSrc"></div>')}
+      ${card('Who lives there', 'the pool is shared between these people', '<div id="cMem"></div>')}
+    </div>
+    <div class="grid" style="margin-top:12px">
+      ${card('Real cost per person', 'salary + PF/ESIC + their share of the guest house', '<div id="cStaff"></div>')}
+      ${card('Charged to customers', 'by visits logged this month', '<div id="cAlloc"></div>', { dim:'party', title:'Staff cost charged out', chart:'rank' })}
+    </div>`;
+  $('#cPrev').onclick = () => { const [y,m]=month.split('-').map(Number);
+    S.costMonth = m>1?`${y}-${String(m-1).padStart(2,'0')}`:`${y-1}-12`; render(); };
+  $('#cNext').onclick = () => { const [y,m]=month.split('-').map(Number);
+    S.costMonth = m<12?`${y}-${String(m+1).padStart(2,'0')}`:`${y+1}-01`; render(); };
+
+  const fac = await api('/api/facilities');
+  $('#cSrc').innerHTML = `<table><thead><tr><th>What the quarter provides</th><th>Amount</th>
+    <th class="num">Using it</th><th class="num">Each pays</th><th>On CTC?</th><th></th></tr></thead><tbody>
+    ${d.pools.map(x => `<tr>
+      <td><b>${esc(x.name)}</b><div class="sub">${esc(x.source)}</div></td>
+      <td class="num">${money(x.month_cost, true)}</td>
+      <td class="num">${x.users}</td>
+      <td class="num">${x.per_head ? money(x.per_head, true) : '—'}</td>
+      <td>${x.charge_to_ctc ? '<span class="tag rev">yes</span>' : '<span class="tag">no</span>'}</td>
+      <td><button class="btn danger" style="padding:2px 7px;font-size:11px" data-rmitem="${x.item_id}">×</button></td>
+    </tr>`).join('') || '<tr><td class="empty">nothing set up</td></tr>'}
+    </tbody></table>
+    <div class="form" style="margin-top:10px">
+      <div class="fld"><label>Add a facility line</label><input id="fiName" placeholder="e.g. Staff Quarter Water"></div>
+      <div class="fld"><label>Fixed amount</label><input id="fiAmt" type="number" step="0.01" placeholder="blank = read ledger"></div>
+      <div class="fld"><label>…or read from category</label><select id="fiCat"><option value="">—</option>
+        ${fac.categories.map(c2=>`<option>${esc(c2.key)}</option>`).join('')}</select></div>
+      <div class="fld"><label>Charge to CTC?</label><select id="fiCtc">
+        <option value="1">Yes — part of their cost</option><option value="0">No — company overhead</option></select></div>
+      <div class="full"><button class="btn pri" id="fiAdd">Add line</button></div>
+    </div>`;
+  $('#fiAdd').onclick = async () => {
+    if (!$('#fiName').value.trim()) return toast('Give it a name', true);
+    await api('/api/facilities/item', { name: $('#fiName').value.trim(),
+      fixed_amount: $('#fiAmt').value || null, category: $('#fiCat').value || null,
+      charge_to_ctc: $('#fiCtc').value === '1' });
+    toast('Added'); render();
+  };
+  v.querySelectorAll('[data-rmitem]').forEach(b => b.onclick = async () => {
+    await api('/api/facilities/item', { remove: +b.dataset.rmitem }); toast('Removed'); render(); });
+
+  $('#cMem').innerHTML = `<div class="note" style="margin-bottom:8px">Tick what each person actually uses.
+      Only ticked lines load onto their CTC.</div>
+    <div style="max-height:40vh;overflow:auto"><table><thead><tr><th>Person</th>
+      ${d.pools.map(x => `<th style="font-size:10px">${esc(x.name.replace('Staff Quarter ',''))}</th>`).join('')}
+      <th class="num">Extra on CTC</th></tr></thead><tbody>
+      ${fac.staff.filter(x => x.active).map(st => {
+        const row = d.rows ? null : null;
+        const person = d.staff.find(z => z.cleaner_id === st.cleaner_id);
+        return `<tr><td><b>${esc(st.name)}</b></td>
+          ${d.pools.map(x => {
+            const on = fac.assigned.some(a => a.cleaner_id === st.cleaner_id && a.item_id === x.item_id);
+            return `<td style="text-align:center"><input type="checkbox" data-use="${st.cleaner_id}"
+              data-item="${x.item_id}" ${on ? 'checked' : ''}></td>`;
+          }).join('')}
+          <td class="num">${person ? money(person.facility_cost, true) : '—'}</td></tr>`;
+      }).join('')}
+    </tbody></table></div>`;
+  v.querySelectorAll('[data-use]').forEach(cb => cb.onchange = async () => {
+    const cleaner_id = +cb.dataset.use, item_id = +cb.dataset.item;
+    if (cb.checked) await api('/api/facilities/assign', { cleaner_id, item_id, weight: 1 });
+    else {
+      const a = fac.assigned.find(x => x.cleaner_id === cleaner_id && x.item_id === item_id);
+      if (a) await api('/api/facilities/assign', { remove: a.sfi_id });
+    }
+    toast('Updated'); render();
+  });
+
+  $('#cStaff').innerHTML = `<table><thead><tr><th>Person</th><th class="num">Salary + PF/ESIC</th>
+    <th class="num">Guest house share</th><th class="num">Real cost</th></tr></thead><tbody>
+    ${d.staff.map(r => `<tr><td><b>${esc(r.name)}</b>${r.on_roll ? '' : ' <span class="tag flag">off-roll</span>'}</td>
+      <td class="num">${money(r.base_cost, true)}</td>
+      <td class="num">${r.facility_cost ? money(r.facility_cost, true) : '—'}
+        ${r.facility_lines && r.facility_lines.length ? `<div class="sub">${r.facility_lines.map(l=>esc(l.item)+' '+money(l.amount)).join(', ')}</div>` : ''}</td>
+      <td class="num out"><b>${money(r.loaded_cost, true)}</b></td></tr>`).join('')}
+    </tbody></table>`;
+
+  const alloc = d.rows.map(r => ({ key: r.party_name, gross: r.staff_cost, txns: Math.round(r.visits) }));
+  CH.rankBars($('#cAlloc'), alloc, { field: 'gross', color: 'var(--out)',
+    onClick: k => addFilter('party', k) });
+  wire(v);
+};
+
+V.loans = async () => {
+  const v = $('#view');
+  const d = await api('/api/loans');
+  const t = d.totals;
+  const fld = (l, n, val, type='text', extra='') =>
+    `<div class="fld"><label>${l}</label><input name="${n}" type="${type}" value="${esc(val ?? '')}" ${extra}></div>`;
+  v.innerHTML = `
+    <div class="kpis">
+      ${kpi('Monthly EMI', money(t.monthly_emi, true), `${t.count} active loans`, 'out')}
+      ${kpi('Still owed', money(t.outstanding, true), 'principal outstanding', 'out')}
+      ${kpi('Loans tracked', String(d.loans.length), 'including closed')}
+      ${kpi('Yearly EMI burden', money(t.monthly_emi * 12, true), 'at the current rate', 'warn')}
+    </div>
+    <div class="grid one">
+      ${card('All loans', 'click a row to edit it', '<div id="lnTable"></div>')}
+    </div>
+    <div class="grid" style="margin-top:12px">
+      ${card('EMI by lender', '', '<div id="lnBars"></div>', { dim:'party', title:'EMI by lender', chart:'rank', field:'money_out' })}
+      ${card('Add or edit a loan', 'everything about one loan in one place', `
+        <form id="lnForm" class="form">
+          <input type="hidden" name="loan_id" id="lnId">
+          ${fld('Name *','name','', 'text','required placeholder="e.g. Ridhika loan 1"')}
+          <div class="fld"><label>Lender</label><input name="lender" list="partyList4" placeholder="who lent it"></div>
+          <datalist id="partyList4">${S.opts.parties.map(x=>`<option value="${esc(x.key)}">`).join('')}</datalist>
+          ${fld('Borrower / in whose name','borrower','')}
+          <div class="fld"><label>Type</label><select name="kind">
+            <option value="hand_loan">Hand loan (from a person)</option>
+            <option value="term">Bank term loan</option><option value="od">Overdraft / CC</option>
+            <option value="vehicle">Vehicle loan</option><option value="personal">Personal loan</option>
+            <option value="bnpl">BNPL / EMI card</option></select></div>
+          ${fld('Principal borrowed','principal','', 'number','step=0.01')}
+          ${fld('Interest rate % p.a.','rate_pct','', 'number','step=0.01')}
+          ${fld('EMI per month','emi','', 'number','step=0.01')}
+          ${fld('EMI day of month','emi_day','', 'number','min=1 max=31')}
+          ${fld('Started','start_month','', 'month')}
+          ${fld('Tenure (months)','tenure_months','', 'number','min=1')}
+          ${fld('EMIs already paid','paid_count','0','number','min=0')}
+          ${fld('Outstanding now','outstanding','', 'number','step=0.01')}
+          <div class="fld"><label>Paid from</label><select name="account_id"><option value="">—</option>
+            ${d.accounts.map(a=>`<option value="${a.account_id}">${esc(a.name)}</option>`).join('')}</select></div>
+          <div class="fld"><label>Shows in Tally?</label><select name="in_books">
+            <option value="1">Yes, in the books</option><option value="0">No, outside the books</option></select></div>
+          <div class="fld full"><label>What did it buy?</label>
+            <input name="purpose" placeholder="e.g. washing machine, car, working capital"></div>
+          <div class="fld full"><label>Note</label><input name="notes"></div>
+          <div class="full"><button class="btn pri" type="submit">Save loan</button>
+            <button class="btn" type="button" id="lnClear" style="margin-left:8px">Clear form</button></div>
+        </form>`)}
+    </div>`;
+  CH.rankBars($('#lnBars'), d.loans.filter(l=>l.active && l.emi)
+      .map(l=>({key:(l.lender||l.name), gross:l.emi, txns:l.tenure_months||0})),
+    { field:'gross', color:'var(--out)' });
+  $('#lnTable').innerHTML = d.loans.length ? `<table><thead><tr>
+    <th>Loan</th><th>Lender</th><th>Type</th><th class="num">Principal</th><th class="num">ROI</th>
+    <th class="num">EMI</th><th class="num">Paid</th><th class="num">Left</th><th>Ends</th>
+    <th class="num">Owed</th><th>Bought</th><th>Books</th><th></th></tr></thead><tbody>
+    ${d.loans.map(l => `<tr class="click" data-loan='${esc(JSON.stringify(l))}'>
+      <td><b>${esc(l.name)}</b></td><td>${esc(l.lender || '—')}</td>
+      <td><span class="tag">${esc(String(l.kind || '').replace(/_/g,' '))}</span></td>
+      <td class="num">${l.principal ? money(l.principal, true) : '—'}</td>
+      <td class="num">${l.rate_pct ? l.rate_pct + '%' : '—'}</td>
+      <td class="num out"><b>${l.emi ? money(l.emi, true) : '—'}</b></td>
+      <td class="num">${l.paid_count || 0}${l.tenure_months ? ' / ' + l.tenure_months : ''}</td>
+      <td class="num">${l.months_left ?? '—'}</td>
+      <td class="mono">${esc(l.computed_end || '—')}</td>
+      <td class="num">${l.outstanding != null ? money(l.outstanding, true) : (l.remaining != null ? money(l.remaining, true) : '—')}</td>
+      <td>${esc(l.purpose || '—')}</td>
+      <td><span class="tag ${l.in_books ? 'tally' : 'manual'}">${l.in_books ? 'in Tally' : 'outside'}</span></td>
+      <td><button class="btn danger" style="padding:2px 7px;font-size:11px" data-del="${l.loan_id}">×</button></td>
+    </tr>`).join('')}</tbody></table>`
+    : '<div class="empty">No loans yet — add the Ridhika and Tarun EMIs using the form</div>';
+  $('#lnTable').querySelectorAll('[data-loan]').forEach(tr => tr.onclick = e => {
+    if (e.target.dataset.del) return;
+    const l = JSON.parse(tr.dataset.loan);
+    const f = $('#lnForm');
+    for (const k of ['name','lender','borrower','kind','principal','rate_pct','emi','emi_day',
+                     'start_month','tenure_months','paid_count','outstanding','purpose','notes']) {
+      if (f[k]) f[k].value = l[k] ?? '';
+    }
+    if (f.account_id) f.account_id.value = l.account_id ?? '';
+    if (f.in_books) f.in_books.value = String(l.in_books ?? 1);
+    $('#lnId').value = l.loan_id;
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  });
+  $('#lnTable').querySelectorAll('[data-del]').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    if (!confirm('Delete this loan?')) return;
+    await api('/api/loans/delete', { loan_id: +b.dataset.del }); toast('Deleted'); render();
+  });
+  $('#lnClear').onclick = () => { $('#lnForm').reset(); $('#lnId').value = ''; };
+  $('#lnForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    if (!b.loan_id) delete b.loan_id;
+    try { await api('/api/loans/save', b); toast('Saved'); render(); }
+    catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.expenses = async () => {
+  const v = $('#view');
+  const month = S.expMonth || '2026-06';
+  const d = await api('/api/expense-heads?month=' + month);
+  const groups = {};
+  for (const h of d.heads) (groups[h.group_name || 'Other'] ||= []).push(h);
+  v.innerHTML = `
+    <div class="banner ok">Each head is either a <b>fixed</b> monthly figure you set here, or
+      <b>not fixed</b> — in which case the actual is read live from the daily ledger using the
+      category or supplier you point it at. The variance column shows where reality drifted.</div>
+    <div class="card" style="margin-bottom:12px"><header>
+      <button class="btn" id="ePrev">←</button><h3 style="text-align:center">${esc(d.month)}</h3>
+      <button class="btn" id="eNext">→</button></header>
+      <div class="body"><div class="kpis" style="margin:0">
+        ${kpi('Fixed monthly total', money(d.totals.fixed, true), `${d.heads.filter(h=>h.is_fixed&&h.active).length} fixed heads`, 'out')}
+        ${kpi('Actual this month', money(d.totals.actual, true), 'from the ledger', 'out')}
+        ${kpi('Heads defined', String(d.heads.length), `${d.heads.filter(h=>!h.is_fixed).length} variable`)}
+      </div></div></div>
+    ${Object.entries(groups).map(([g, hs]) => `
+      <div class="grid one" style="margin-bottom:12px">${card(g, `${hs.length} heads`, `
+        <table><thead><tr><th>Head</th><th>Type</th><th class="num">Fixed amount</th>
+          <th>Reads from</th><th class="num">Actual ${esc(d.month)}</th><th class="num">Variance</th>
+          <th class="num">Due</th></tr></thead><tbody>
+        ${hs.map(h => `<tr class="click" data-head='${esc(JSON.stringify(h))}'>
+          <td><b>${esc(h.name)}</b>${h.active ? '' : ' <span class="tag">off</span>'}</td>
+          <td><span class="tag ${h.is_fixed ? 'tally' : 'flag'}">${h.is_fixed ? 'fixed' : 'variable'}</span></td>
+          <td class="num">${h.fixed_amount != null ? money(h.fixed_amount, true) : '—'}</td>
+          <td>${esc(h.category || h.party || '<span style="color:var(--muted-2)">not linked</span>')}</td>
+          <td class="num">${h.actual != null ? money(h.actual, true) : '—'}</td>
+          <td class="num ${h.variance > 0 ? 'out' : h.variance < 0 ? 'in' : ''}">${h.variance != null ? money(h.variance, true) : '—'}</td>
+          <td class="num">${h.due_day ? h.due_day + 'th' : '—'}</td></tr>`).join('')}
+        </tbody></table>`)}</div>`).join('')}
+    <div class="grid one">
+      ${card('Add or edit an expense head', '', `
+        <form id="ehForm" class="form">
+          <input type="hidden" name="head_id" id="ehId">
+          <div class="fld"><label>Name *</label><input name="name" required></div>
+          <div class="fld"><label>Group</label><select name="group_name">
+            ${['Rent','Utilities','Vendor','Daily','EMI','Staff','Other'].map(g=>`<option>${g}</option>`).join('')}</select></div>
+          <div class="fld"><label>Fixed or variable</label><select name="is_fixed">
+            <option value="1">Fixed — same every month</option>
+            <option value="0">Not fixed — read from the daily ledger</option></select></div>
+          <div class="fld"><label>Fixed amount</label><input name="fixed_amount" type="number" step="0.01"></div>
+          <div class="fld"><label>Read actuals from category</label><select name="category">
+            <option value="">—</option>${d.categories.filter(c=>c.kind!=='revenue').map(c=>`<option>${esc(c.key)}</option>`).join('')}</select></div>
+          <div class="fld"><label>…or from supplier</label><input name="party" list="partyList5"></div>
+          <datalist id="partyList5">${S.opts.parties.map(x=>`<option value="${esc(x.key)}">`).join('')}</datalist>
+          <div class="fld"><label>Due day</label><input name="due_day" type="number" min="1" max="31"></div>
+          <div class="fld full"><label>Note</label><input name="notes"></div>
+          <div class="full"><button class="btn pri">Save head</button>
+            <button class="btn" type="button" id="ehClear" style="margin-left:8px">Clear</button></div>
+        </form>`)}
+    </div>`;
+  $('#ePrev').onclick = () => { const [y,m]=month.split('-').map(Number);
+    S.expMonth = m>1?`${y}-${String(m-1).padStart(2,'0')}`:`${y-1}-12`; render(); };
+  $('#eNext').onclick = () => { const [y,m]=month.split('-').map(Number);
+    S.expMonth = m<12?`${y}-${String(m+1).padStart(2,'0')}`:`${y+1}-01`; render(); };
+  v.querySelectorAll('[data-head]').forEach(tr => tr.onclick = () => {
+    const h = JSON.parse(tr.dataset.head), f = $('#ehForm');
+    for (const k of ['name','group_name','fixed_amount','due_day','notes']) if (f[k]) f[k].value = h[k] ?? '';
+    f.is_fixed.value = String(h.is_fixed ?? 1);
+    f.category.value = h.category || ''; f.party.value = h.party || '';
+    $('#ehId').value = h.head_id;
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  });
+  $('#ehClear').onclick = () => { $('#ehForm').reset(); $('#ehId').value = ''; };
+  $('#ehForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    b.is_fixed = b.is_fixed === '1';
+    if (!b.head_id) delete b.head_id;
+    try { await api('/api/expense-heads/save', b); toast('Saved'); render(); }
+    catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.bank = async () => {
+  const v = $('#view');
+  const status = S.bankStatus || 'unmatched';
+  const month = S.bankMonth || '';
+  const d = await api(`/api/bank?status=${status}&month=${month}`);
+  const su = d.summary;
+  v.innerHTML = `
+    <div class="banner ok">Bank rows are kept <b>apart from the ledger</b> on purpose. A statement records
+      cash moving; Tally records what was earned or owed. Posting every bank row straight in would
+      double-count every invoice that was also paid. Matched rows are already in Tally —
+      the unmatched ones are the money your books cannot see. Post the real ones; ignore transfers.</div>
+    <div class="kpis">
+      ${kpi('Bank rows', String(su.n), d.accounts.map(a => a.nickname).join(', '))}
+      ${kpi('Already in Tally', String(su.matched), 'matched on amount and date', 'in')}
+      ${kpi('Not in Tally', String(su.unmatched), 'waiting for you', su.unmatched ? 'warn' : 'in')}
+      ${kpi('Posted by you', String(su.posted), 'now in the ledger', 'cap')}
+      ${kpi('Ignored', String(su.ignored), 'transfers, duplicates')}
+    </div>
+    <div class="grid">
+      ${card('Money through the bank, by month', '', '<div id="bkBars"></div>', { dim:'month', title:'Money through the bank', chart:'bar' })}
+      ${card('What the unmatched rows look like', '', '<div id="bkCat"></div>', { dim:'category', title:'Bank rows by type', chart:'rank' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Bank rows', 'tick rows, choose a category, then post or ignore them together', `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          ${['unmatched','matched','posted','ignored','all'].map(x =>
+            `<button class="btn ${x===status?'pri':''}" data-st="${x}">${x}</button>`).join('')}
+          <select id="bkMonth" style="padding:6px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
+            <option value="">All months</option>
+            ${d.months.map(m => `<option value="${esc(m.key)}" ${m.key===month?'selected':''}>${esc(m.key)} (${m.n})</option>`).join('')}
+          </select>
+          <span style="margin-left:auto"></span>
+          <select id="bkCatPick" style="padding:6px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
+            <option value="">Set category…</option>
+            ${d.categories.map(c => `<option>${esc(c.key)}</option>`).join('')}
+          </select>
+          <button class="btn pri" id="bkPost">Post ticked to ledger</button>
+          <button class="btn" id="bkIgnore">Ignore ticked</button>
+        </div>
+        <div style="max-height:52vh;overflow:auto"><table><thead><tr>
+          <th><input type="checkbox" id="bkAll"></th><th>Date</th><th>Particulars</th><th>Name</th>
+          <th>Nature</th><th class="num">Out</th><th class="num">In</th><th>Category</th>
+          <th>Status</th></tr></thead><tbody>
+          ${d.rows.map(r => `<tr>
+            <td><input type="checkbox" class="bkPick" data-id="${r.bt_id}"></td>
+            <td class="mono">${fmtDate(r.txn_date)}</td>
+            <td style="max-width:260px;font-size:11.5px;color:var(--muted)">${esc((r.particulars||'').slice(0,60))}</td>
+            <td>${esc(r.counterparty || '—')}</td>
+            <td>${r.nature ? `<span class="tag">${esc(r.nature)}</span>` : ''}</td>
+            <td class="num out">${r.debit ? money(r.debit, true) : ''}</td>
+            <td class="num in">${r.credit ? money(r.credit, true) : ''}</td>
+            <td>${esc(r.category || '')}${r.notes ? `<div class="sub">${esc(r.notes)}</div>` : ''}</td>
+            <td><span class="tag ${r.status==='matched'?'rev':r.status==='posted'?'tally':r.status==='ignored'?'':'flag'}">${esc(r.status)}</span></td>
+          </tr>`).join('')}
+        </tbody></table></div>
+        <div class="note" style="margin-top:8px">${d.rows.length} shown${d.rows.length>=400?' (first 400)':''}</div>`)}
+    </div>`;
+  CH.groupedBars($('#bkBars'), d.months.map(m => ({ key: m.key, revenue: m.c, opcost: m.d, txns: m.n })),
+    { keys: [{ f:'revenue', c:'var(--in)', n:'In' }, { f:'opcost', c:'var(--out)', n:'Out' }],
+      onClick: k => { S.bankMonth = k; render(); } });
+  const cats = {};
+  for (const r of d.rows) {
+    const k = r.nature || (r.notes || '').replace(/^looks like /,'').replace(/ —.*$/,'').replace(/ needs.*$/,'') || 'Unclassified';
+    cats[k] = (cats[k] || 0) + (r.debit || 0) + (r.credit || 0);
+  }
+  CH.rankBars($('#bkCat'), Object.entries(cats).map(([k, vv]) => ({ key: k, gross: vv, txns: 0 })).slice(0, 12),
+    { field: 'gross' });
+  v.querySelectorAll('[data-st]').forEach(b => b.onclick = () => { S.bankStatus = b.dataset.st; render(); });
+  $('#bkMonth').onchange = e => { S.bankMonth = e.target.value; render(); };
+  $('#bkAll').onchange = e => v.querySelectorAll('.bkPick').forEach(c => c.checked = e.target.checked);
+  const picked = () => [...v.querySelectorAll('.bkPick:checked')].map(c => +c.dataset.id);
+  $('#bkCatPick').onchange = async e => {
+    const ids = picked();
+    if (!ids.length) return toast('Tick some rows first', true);
+    await api('/api/bank/set', { bt_ids: ids, category: e.target.value });
+    toast(`Category set on ${ids.length} rows`); render();
+  };
+  $('#bkPost').onclick = async () => {
+    const ids = picked();
+    if (!ids.length) return toast('Tick some rows first', true);
+    if (!confirm(`Post ${ids.length} bank rows into the ledger?\n\nThey will be tagged "not in Tally" and marked needs-review.`)) return;
+    const r = await api('/api/bank/post', { bt_ids: ids });
+    toast(`Posted ${r.posted} entries`); refresh();
+  };
+  $('#bkIgnore').onclick = async () => {
+    const ids = picked();
+    if (!ids.length) return toast('Tick some rows first', true);
+    await api('/api/bank/set', { bt_ids: ids, status: 'ignored' });
+    toast(`Ignored ${ids.length}`); render();
+  };
+  wire(v);
+};
+
+V.staff = async () => {
+  const v = $('#view');
+  const month = S.staffMonth || '';
+  const d = await api('/api/staff' + (month ? '?month=' + month : ''));
+  const t = d.totals;
+  const cur = d.staff.filter(x => x.active), gone = d.staff.filter(x => !x.active);
+  const needSal = cur.filter(x => !x.employer_cost);
+  v.innerHTML = `
+    ${needSal.length ? `<div class="banner warn"><b>${needSal.length} current staff have no salary on record</b>
+      — ${needSal.map(x => esc(x.name)).join(', ')}. They are paid in cash or from another bank,
+      so your labour cost is understated until those figures are entered.</div>` : ''}
+    ${d.gaps.length ? `<div class="banner bad"><b>Known data gaps (${d.gaps.length}):</b>
+      ${d.gaps.map(g => `${esc(g.what)}${g.period ? ' (' + esc(g.period) + ')' : ''}`).join(' · ')}</div>` : ''}
+    <div class="kpis">
+      ${kpi('Current staff', String(t.current), `${t.on_roll} on-roll, ${t.cash} cash`, 'in')}
+      ${kpi('Monthly CTC', money(t.ctc, true), 'on-roll only — cash staff not included', 'out')}
+      ${kpi('Left the company', String(t.former), 'with dated tenure')}
+      ${kpi('Attendance months', String(t.attendance_months), 'Sep 2025 → Sep 2026')}
+      ${kpi('Missing salary', String(t.missing_salary), 'current staff', t.missing_salary ? 'warn' : 'in')}
+    </div>
+    <div class="grid">
+      ${card('Headcount by month', 'click a month for that roster', '<div id="stHead"></div>')}
+      ${card('Days present, top 12', '', '<div id="stDays"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card(`Current staff (${cur.length})`, 'click a row to edit', '<div id="stCur"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card(`Left the company (${gone.length})`, 'tenure taken from the attendance sheet', '<div id="stGone"></div>')}
+    </div>
+    ${d.perMonth.length ? `<div class="grid one" style="margin-top:12px">
+      ${card(`Roster for ${esc(month)}`, `${d.perMonth.length} people`, `
+        <table><thead><tr><th>Person</th><th class="num">Present</th><th class="num">Absent</th>
+          <th class="num">Holiday</th><th class="num">Days marked</th><th>Pay</th></tr></thead><tbody>
+        ${d.perMonth.map(r => `<tr><td><b>${esc(r.name || r.staff_name)}</b></td>
+          <td class="num in">${Math.round(r.present)}</td>
+          <td class="num out">${Math.round(r.absent)}</td>
+          <td class="num">${Math.round(r.leave_days || 0)}</td>
+          <td class="num">${Math.round(r.total_days || 0)}</td>
+          <td>${r.employer_cost ? money(r.employer_cost) : '<span class="tag flag">cash</span>'}</td>
+        </tr>`).join('')}</tbody></table>`)}</div>` : ''}
+    <div class="grid one" style="margin-top:12px">
+      ${card('Add or edit a person', '', `
+        <form id="stForm" class="form">
+          <input type="hidden" name="cleaner_id" id="stId">
+          <div class="fld"><label>Name *</label><input name="name" required></div>
+          <div class="fld"><label>Monthly salary</label><input name="monthly_salary" type="number" step="0.01"></div>
+          <div class="fld"><label>Employer cost (CTC)</label><input name="employer_cost" type="number" step="0.01"></div>
+          <div class="fld"><label>Pay type</label><select name="pay_type">
+            <option value="monthly_salary">Monthly salary</option>
+            <option value="per_visit">Per visit</option></select></div>
+          <div class="fld"><label>Per visit rate</label><input name="pay_rate" type="number" step="0.01"></div>
+          <div class="fld"><label>On ESIC / PF?</label><select name="on_roll">
+            <option value="1">Yes — on the roll</option>
+            <option value="0">No — paid in cash / other bank</option></select></div>
+          <div class="fld"><label>Joined</label><input name="joined_month" type="month"></div>
+          <div class="fld"><label>Left</label><input name="exit_month" type="month"></div>
+          <div class="fld"><label>Status</label><select name="active">
+            <option value="1">Current</option><option value="0">Left</option></select></div>
+          <div class="fld full"><label>Note</label><input name="notes"></div>
+          <div class="full"><button class="btn pri">Save</button>
+            <button class="btn" type="button" id="stClear" style="margin-left:8px">Clear</button></div>
+        </form>`)}
+    </div>`;
+
+  CH.groupedBars($('#stHead'), d.months.map(m => ({ key: m.key, revenue: m.present, opcost: m.absent, txns: m.people })),
+    { keys: [{ f:'revenue', c:'var(--in)', n:'Days present' }, { f:'opcost', c:'var(--out)', n:'Days absent' }],
+      onClick: k => { S.staffMonth = k; render(); } });
+  CH.rankBars($('#stDays'), d.staff.slice(0, 12).map(x => ({ key: x.name, gross: x.present, txns: x.att_months })),
+    { field: 'gross', color: 'var(--water)' });
+
+  const tbl = (list) => list.length ? `<div style="max-height:44vh;overflow:auto"><table><thead><tr>
+    <th>Name</th><th>Joined</th><th>Left</th><th class="num">Months</th><th class="num">Present</th>
+    <th class="num">Absent</th><th class="num">Salary</th><th class="num">CTC</th><th>Pay route</th>
+    <th class="num">Props</th></tr></thead><tbody>
+    ${list.map(x => `<tr class="click" data-st='${esc(JSON.stringify(x))}'>
+      <td><b>${esc(x.name)}</b></td>
+      <td class="mono">${esc(x.joined_month || '—')}</td>
+      <td class="mono">${esc(x.exit_month || '—')}</td>
+      <td class="num">${x.att_months}</td>
+      <td class="num in">${Math.round(x.present)}</td>
+      <td class="num out">${Math.round(x.absent)}</td>
+      <td class="num">${x.monthly_salary ? money(x.monthly_salary, true) : '—'}</td>
+      <td class="num">${x.employer_cost ? money(x.employer_cost, true) : '—'}</td>
+      <td>${x.on_roll ? '<span class="tag rev">ESIC/PF</span>' : '<span class="tag flag">cash</span>'}</td>
+      <td class="num">${x.props || '—'}</td></tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty">nobody here</div>';
+  $('#stCur').innerHTML = tbl(cur);
+  $('#stGone').innerHTML = tbl(gone);
+  v.querySelectorAll('[data-st]').forEach(tr => tr.onclick = () => {
+    const x = JSON.parse(tr.dataset.st), f = $('#stForm');
+    for (const k of ['name','monthly_salary','employer_cost','pay_type','pay_rate','joined_month','exit_month','notes'])
+      if (f[k]) f[k].value = x[k] ?? '';
+    f.on_roll.value = String(x.on_roll ?? 1);
+    f.active.value = String(x.active ?? 1);
+    $('#stId').value = x.cleaner_id;
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  });
+  $('#stClear').onclick = () => { $('#stForm').reset(); $('#stId').value = ''; };
+  $('#stForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    b.on_roll = b.on_roll === '1'; b.active = b.active === '1';
+    if (!b.cleaner_id) delete b.cleaner_id;
+    try { await api('/api/staff/save', b); toast('Saved'); loadAux(); render(); }
+    catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.suspense = async () => {
+  const v = $('#view');
+  const kind = S.suspKind || 'bank';
+  const d = await api('/api/suspense?kind=' + kind);
+  const c = d.counts;
+  const money2 = x => money(x, true);
+  // only offer a section that still has something in it
+  const ALL2 = [
+    ['bank',      `Bank, no category (${c.bank.n})`,            c.bank.n],
+    ['flagged',   `Flagged (${c.flagged.n})`,                   c.flagged.n],
+    ['review',    `Needs review (${c.review.n})`,               c.review.n],
+    ['proposals', `Pay proposals (${c.proposals.n})`,           c.proposals.n],
+    ['gaps',      `Known gaps (${c.gaps.n})`,                   c.gaps.n],
+    ['external',  `Marked external (${c.external.n + c.extbank.n})`, c.external.n + c.extbank.n],
+  ];
+  const TABS2 = ALL2.filter(t => t[2] > 0 || t[0] === kind).map(t => [t[0], t[1]]);
+  if (!TABS2.length) {
+    v.innerHTML = `<div class="banner ok" style="margin-top:20px"><b>Nothing left in Suspense.</b>
+      Every bank row is categorised, no entries are flagged or awaiting review,
+      and there are no open data gaps.</div>`;
+    return;
+  }
+  if (!TABS2.some(t => t[0] === kind)) { S.suspKind = TABS2[0][0]; return render(); }
+  v.innerHTML = `
+    <div class="banner warn">Everything unresolved sits here. Mark a row <b>External</b> when the money
+      is not Swabha's own trade — someone else paid, Swabha bought, the GST credit landed here.
+      External rows stay visible but are <b>excluded from Swabha's revenue, cost and profit</b>
+      everywhere else. <b>Move to actuals</b> brings one back.</div>
+    <div class="kpis">
+      ${c.bank.n ? kpi('Bank rows unresolved', String(c.bank.n), `in ${money2(c.bank.c)} · out ${money2(c.bank.d)}`, 'warn') : ''}
+      ${c.flagged.n ? kpi('Flagged entries', String(c.flagged.n), 'GST, no party, unclassified', 'warn') : ''}
+      ${c.review.n ? kpi('Awaiting review', String(c.review.n), 'imported, unconfirmed') : ''}
+      ${(c.external.n + c.extbank.n) ? kpi('Marked external', String(c.external.n + c.extbank.n), 'kept out of the figures', 'cap') : ''}
+      ${c.gaps.n ? kpi('Known gaps', String(c.gaps.n), 'data you still owe the system', 'warn') : ''}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+      ${TABS2.map(([k, n]) => `<button class="btn ${k === kind ? 'pri' : ''}" data-sk="${k}">${n}</button>`).join('')}
+    </div>
+    <div class="grid one">
+      ${card(TABS2.find(t => t[0] === kind)[1], 'tick rows, then choose what to do with them', `
+        ${['bank','flagged','review','external'].includes(kind) ? `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          <label style="font-size:12px"><input type="checkbox" id="spAll"> select all</label>
+          <select id="spCat" style="padding:6px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
+            <option value="">Set category…</option>
+            ${d.categories.map(x => `<option>${esc(x.key)}</option>`).join('')}
+          </select>
+          <span style="margin-left:auto"></span>
+          ${kind === 'external'
+            ? `<button class="btn pri" id="spActual">Move back to actuals</button>`
+            : `<button class="btn" id="spExternal">Mark external</button>
+               <button class="btn pri" id="spCleared">Mark cleared</button>`}
+        </div>` : ''}
+        <div id="spBody"></div>`)}
+    </div>`;
+  v.querySelectorAll('[data-sk]').forEach(b => b.onclick = () => { S.suspKind = b.dataset.sk; render(); });
+
+  const box = $('#spBody');
+  const pickCol = id => `<td><input type="checkbox" class="spPick" data-id="${id}"></td>`;
+  if (kind === 'bank') {
+    box.innerHTML = d.rows.length ? `<div style="max-height:56vh;overflow:auto"><table><thead><tr>
+      <th></th><th>Date</th><th>Bank</th><th>In/Out</th><th class="num">Amount</th>
+      <th>Description</th><th>Name</th></tr></thead><tbody>
+      ${d.rows.map(r => `<tr>${pickCol(r.bt_id)}
+        <td class="mono">${fmtDate(r.txn_date)}</td><td>${esc(r.bank)}</td>
+        <td>${r.credit ? '<span class="tag rev">received</span>' : '<span class="tag cost">paid out</span>'}</td>
+        <td class="num ${r.credit ? 'in' : 'out'}"><b>${money(r.credit || r.debit, true)}</b></td>
+        <td style="font-size:11.5px;color:var(--muted);max-width:340px">${esc(String(r.particulars || '').slice(0, 80))}</td>
+        <td>${esc(r.counterparty || '—')}</td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty">Nothing left here</div>';
+  } else if (kind === 'flagged' || kind === 'review' || kind === 'external') {
+    box.innerHTML = d.rows.length ? `<div style="max-height:56vh;overflow:auto"><table><thead><tr>
+      <th></th><th>Date</th><th>Party</th><th>Category</th><th class="num">Amount</th>
+      <th>Source</th><th>${kind === 'flagged' ? 'Why it is flagged' : kind === 'external' ? 'Note' : 'Narration'}</th>
+      <th></th></tr></thead><tbody>
+      ${d.rows.map(r => `<tr>${pickCol(r.txn_id)}
+        <td class="mono">${fmtDate(r.txn_date)}</td><td>${esc(r.party || '—')}</td>
+        <td>${esc(r.category || '—')}</td>
+        <td class="num ${r.direction === 'in' ? 'in' : 'out'}"><b>${money(r.gross_amount, true)}</b></td>
+        <td><span class="tag ${r.source === 'Tally' ? 'tally' : 'manual'}">${esc(r.source || '')}</span></td>
+        <td style="font-size:11.5px;color:var(--muted);max-width:360px">${esc(String(r.flags || r.suspense_note || r.narration || '').slice(0, 110))}</td>
+        <td><button class="btn rowedit" data-txn="${r.txn_id}" style="padding:2px 9px;font-size:11.5px">Edit</button></td>
+      </tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty">Nothing left here</div>';
+    box.querySelectorAll('button.rowedit').forEach(b =>
+      b.onclick = () => openTxn(+b.dataset.txn, async () => { render(); refresh(); }));
+  } else if (kind === 'proposals') {
+    box.innerHTML = d.rows.length ? `<table><thead><tr><th>Person</th><th class="num">Suggested</th>
+      <th>Confidence</th><th>Basis</th><th></th></tr></thead><tbody>
+      ${d.rows.map(r => `<tr><td><b>${esc(r.staff || r.staff_name)}</b></td>
+        <td class="num">${money(r.suggested, true)}</td>
+        <td><span class="tag ${r.confidence === 'high' ? 'rev' : 'flag'}">${esc(r.confidence)}</span></td>
+        <td style="font-size:11.5px;color:var(--muted)">${esc(r.basis || '')}</td>
+        <td><button class="btn" data-accept="${r.cleaner_id}" data-amt="${r.suggested}"
+              style="padding:2px 9px;font-size:11.5px">Accept</button></td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty">No open proposals</div>';
+    box.querySelectorAll('[data-accept]').forEach(b => b.onclick = async () => {
+      const amt = prompt('Monthly salary to record:', b.dataset.amt);
+      if (amt === null) return;
+      await api('/api/staff/save', { cleaner_id: +b.dataset.accept, monthly_salary: amt,
+        employer_cost: amt, on_roll: false, active: true });
+      toast('Salary recorded'); render();
+    });
+  } else {
+    box.innerHTML = d.rows.length ? `<table><thead><tr><th>Area</th><th>Period</th><th>What is missing</th>
+      <th>Why</th><th>Status</th></tr></thead><tbody>
+      ${d.rows.map(r => `<tr><td><b>${esc(r.area)}</b></td><td class="mono">${esc(r.period || '—')}</td>
+        <td>${esc(r.what)}</td><td style="color:var(--muted);font-size:11.5px">${esc(r.why || '')}</td>
+        <td><span class="tag ${r.status === 'open' ? 'flag' : 'rev'}">${esc(r.status)}</span></td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty">No open gaps</div>';
+  }
+
+  const picked = () => [...v.querySelectorAll('.spPick:checked')].map(x => +x.dataset.id);
+  const send = async (action, extra = {}) => {
+    const ids = picked();
+    if (!ids.length) return toast('Tick some rows first', true);
+    const key = kind === 'bank' ? 'bt_ids' : 'txn_ids';
+    await api('/api/suspense/act', { [key]: ids, action, ...extra });
+    toast(`${ids.length} row${ids.length > 1 ? 's' : ''} updated`); render(); refresh();
+  };
+  if ($('#spAll')) $('#spAll').onchange = e => v.querySelectorAll('.spPick').forEach(x => x.checked = e.target.checked);
+  if ($('#spCat')) $('#spCat').onchange = e => e.target.value && send('category', { category: e.target.value });
+  if ($('#spExternal')) $('#spExternal').onclick = async () => {
+    const note = prompt('Why is this not Swabha\'s own money? (shown in the Suspense list)',
+      'someone else paid; Swabha purchased and took the GST credit');
+    if (note === null) return; send('external', { note });
+  };
+  if ($('#spActual')) $('#spActual').onclick = () => send('actual');
+  if ($('#spCleared')) $('#spCleared').onclick = () => send(kind === 'bank' ? 'ignore' : 'cleared');
+  wire(v);
+};
+
+V.assets = async () => {
+  const v = $('#view');
+  const d = await api('/api/assets');
+  const t = d.totals;
+  v.innerHTML = `
+    <div class="kpis">
+      ${kpi('Assets tracked', String(t.count), 'all statuses')}
+      ${kpi('Book value', money(t.value, true), 'excluding written off', 'cap')}
+      ${kpi('Nobody responsible', String(t.unassigned), 'in use, no custodian', t.unassigned ? 'warn' : 'in')}
+      ${kpi('Reported lost', String(t.lost), '', t.lost ? 'out' : 'in')}
+    </div>
+    <div class="grid">
+      ${card('Value by person responsible', 'who is holding how much', '<div id="asBars"></div>', { dim:'category', title:'Assets by person', chart:'rank' })}
+      ${card('By category', '', '<div id="asDonut"></div>', { dim:'category', title:'Assets by category', chart:'donut' })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Asset register', 'click a row to edit or hand it over', '<div id="asTable"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Add or edit an asset', 'the custodian is who answers for it', `
+        <form id="asForm" class="form">
+          <input type="hidden" name="asset_id" id="asId">
+          <div class="fld"><label>Name *</label><input name="name" required placeholder="e.g. Washing machine IFB 7kg"></div>
+          <div class="fld"><label>Category</label><select name="category">
+            ${['machine','vehicle','phone','laptop','equipment','furniture','other'].map(c=>`<option>${c}</option>`).join('')}</select></div>
+          <div class="fld"><label>Serial / reg no.</label><input name="serial_no"></div>
+          <div class="fld"><label>Bought on</label><input name="purchase_date" type="date"></div>
+          <div class="fld"><label>Cost</label><input name="cost" type="number" step="0.01"></div>
+          <div class="fld"><label>Supplier</label><input name="supplier" list="partyList6"></div>
+          <datalist id="partyList6">${S.opts.parties.map(x=>`<option value="${esc(x.key)}">`).join('')}</datalist>
+          <div class="fld"><label>Who is responsible *</label><select name="custodian_id">
+            <option value="">— nobody yet —</option>
+            ${d.staff.map(x=>`<option value="${x.cleaner_id}">${esc(x.name)}${x.active?'':' (former)'}</option>`).join('')}</select></div>
+          <div class="fld"><label>Kept at property</label><select name="property_id"><option value="">—</option>
+            ${d.properties.map(x=>`<option value="${x.property_id}">${esc(x.property_id)} · ${esc(x.name)}</option>`).join('')}</select></div>
+          <div class="fld"><label>Condition</label><select name="condition">
+            ${['working','needs repair','damaged','scrap'].map(c=>`<option>${c}</option>`).join('')}</select></div>
+          <div class="fld"><label>Status</label><select name="status">
+            ${['in_use','idle','lost','returned','written_off'].map(c=>`<option value="${c}">${c.replace('_',' ')}</option>`).join('')}</select></div>
+          <div class="fld"><label>Useful life (months)</label><input name="useful_life_months" type="number"></div>
+          <div class="fld full"><label>Note</label><input name="notes"></div>
+          <div class="full"><button class="btn pri">Save asset</button>
+            <button class="btn" type="button" id="asClear" style="margin-left:8px">Clear</button>
+            <span class="note" style="margin-left:8px">changing the custodian records a dated handover</span></div>
+        </form>
+        <div id="asHist" style="margin-top:14px"></div>`)}
+    </div>`;
+  const byPerson = {};
+  for (const a of d.assets) {
+    const k = a.custodian || '(nobody)';
+    byPerson[k] = (byPerson[k] || 0) + (a.cost || 0);
+  }
+  CH.rankBars($('#asBars'), Object.entries(byPerson).map(([k, vv]) => ({ key: k, gross: vv, txns: 0 })),
+    { field: 'gross', color: 'var(--cap)' });
+  const byCat = {};
+  for (const a of d.assets) byCat[a.category || 'other'] = (byCat[a.category || 'other'] || 0) + (a.cost || 0);
+  CH.donut($('#asDonut'), Object.entries(byCat).map(([k, vv]) => ({ key: k, gross: vv, txns: 0 })),
+    { centreLabel: 'assets' });
+  $('#asTable').innerHTML = d.assets.length ? `<div style="max-height:46vh;overflow:auto"><table><thead><tr>
+    <th>Asset</th><th>Category</th><th>Serial</th><th class="num">Cost</th><th>Bought</th>
+    <th>Responsible</th><th>Where</th><th>Condition</th><th>Status</th><th></th></tr></thead><tbody>
+    ${d.assets.map(a => `<tr class="click" data-asset='${esc(JSON.stringify(a))}'>
+      <td><b>${esc(a.name)}</b></td><td>${esc(a.category || '—')}</td>
+      <td class="mono">${esc(a.serial_no || '—')}</td>
+      <td class="num">${a.cost ? money(a.cost, true) : '—'}</td>
+      <td class="mono">${fmtDate(a.purchase_date)}</td>
+      <td>${a.custodian ? '<b>' + esc(a.custodian) + '</b>' : '<span class="tag flag">nobody</span>'}
+        ${a.handovers > 1 ? `<div class="sub">${a.handovers} handovers</div>` : ''}</td>
+      <td>${esc(a.property || '—')}</td><td>${esc(a.condition || '—')}</td>
+      <td><span class="tag ${a.status === 'lost' ? 'cost' : a.status === 'in_use' ? 'rev' : ''}">${esc(String(a.status).replace('_',' '))}</span></td>
+      <td><button class="btn danger" style="padding:2px 7px;font-size:11px" data-del="${a.asset_id}">×</button></td>
+    </tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty">No assets yet — add the washing machines, vehicles and phones</div>';
+  $('#asTable').querySelectorAll('[data-asset]').forEach(tr => tr.onclick = async e => {
+    if (e.target.dataset.del) return;
+    const a = JSON.parse(tr.dataset.asset), f = $('#asForm');
+    for (const k of ['name','category','serial_no','purchase_date','cost','condition','status',
+                     'useful_life_months','notes']) if (f[k]) f[k].value = a[k] ?? '';
+    f.supplier.value = a.supplier || '';
+    f.custodian_id.value = a.custodian_id ?? '';
+    f.property_id.value = a.property_id ?? '';
+    $('#asId').value = a.asset_id;
+    const h = await api('/api/assets/history?asset_id=' + a.asset_id);
+    $('#asHist').innerHTML = h.length ? `<b style="font-size:12px">Custody history</b>
+      <table style="margin-top:6px"><tbody>${h.map(x => `<tr>
+        <td>${esc(x.name || '—')}</td><td class="mono">${fmtDate(x.from_date)} → ${x.to_date ? fmtDate(x.to_date) : 'now'}</td>
+        <td style="color:var(--muted)">${esc(x.note || '')}</td></tr>`).join('')}</tbody></table>` : '';
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  });
+  $('#asTable').querySelectorAll('[data-del]').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    if (!confirm('Delete this asset?')) return;
+    await api('/api/assets/delete', { asset_id: +b.dataset.del }); toast('Deleted'); render();
+  });
+  $('#asClear').onclick = () => { $('#asForm').reset(); $('#asId').value = ''; $('#asHist').innerHTML = ''; };
+  $('#asForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    if (!b.asset_id) delete b.asset_id;
+    try { await api('/api/assets/save', b); toast('Saved'); render(); }
+    catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.merge = async () => {
+  const v = $('#view');
+  const entity = S.mergeEntity || 'party';
+  const c = await api('/api/merge/candidates?entity=' + entity);
+  v.innerHTML = `
+    <div class="banner warn">The same person or company often appears under several spellings.
+      Merging moves <b>every</b> transaction, invoice, mapping and rate onto the one you keep,
+      then removes the duplicate. It is written to the change log so you can always see what happened.</div>
+    <div style="margin-bottom:12px">
+      ${['party','cleaner','account'].map(e => `<button class="btn ${e===entity?'pri':''}"
+        data-ent="${e}" style="margin-right:6px">${e === 'party' ? 'Customers & suppliers' : e === 'cleaner' ? 'Staff' : 'Bank accounts'}</button>`).join('')}
+    </div>
+    <div class="grid one">
+      ${card(`Likely duplicates (${c.length})`, 'the one with more history is suggested as the keeper',
+        c.length ? `<div style="max-height:56vh;overflow:auto"><table><thead><tr>
+          <th>Keep</th><th>Merge into it</th><th class="num">Match</th><th>Why</th><th></th></tr></thead><tbody>
+          ${c.map((p, i) => {
+            const keepA = p.suggest_keep === p.a.id;
+            const K = keepA ? p.a : p.b, M = keepA ? p.b : p.a;
+            return `<tr>
+              <td><b>${esc(K.name)}</b><div class="sub">${K.uses} linked rows</div></td>
+              <td>${esc(M.name)}<div class="sub">${M.uses} linked rows</div></td>
+              <td class="num">${(p.score*100).toFixed(0)}%</td>
+              <td style="color:var(--muted)">${esc(p.why)}</td>
+              <td style="white-space:nowrap">
+                <button class="btn pri" style="padding:3px 9px;font-size:11.5px"
+                  data-keep="${K.id}" data-merge="${M.id}">Merge</button>
+                <button class="btn" style="padding:3px 9px;font-size:11.5px"
+                  data-keep="${M.id}" data-merge="${K.id}" title="keep the other one instead">Swap</button>
+              </td></tr>`;
+          }).join('')}</tbody></table></div>`
+        : '<div class="empty">No likely duplicates found</div>')}
+    </div>`;
+  v.querySelectorAll('[data-ent]').forEach(b => b.onclick = () => { S.mergeEntity = b.dataset.ent; render(); });
+  v.querySelectorAll('[data-keep]').forEach(b => b.onclick = async () => {
+    const keep_id = +b.dataset.keep, merge_id = +b.dataset.merge;
+    try {
+      const pv = await api('/api/merge/preview', { entity, keep_id, merge_id });
+      const lines = pv.refs.map(r => `  ${r.rows} rows in ${r.table}`).join('\n');
+      if (!confirm(`Merge "${pv.drop[entity === 'party' ? 'display_name' : 'name']}"\ninto "${pv.keep[entity === 'party' ? 'display_name' : 'name']}"?\n\nThis moves:\n${lines || '  (nothing linked)'}\n\nThe duplicate is then deleted.`)) return;
+      const r = await api('/api/merge/apply', { entity, keep_id, merge_id });
+      toast(`Merged into ${r.kept}`);
+      loadAux(); render();
+    } catch (e) { toast(e.message, true); }
+  });
+  wire(v);
+};
+
+V.masters = () => {
+  const v = $('#view'), m = S.masters;
+  if (!m) return v.innerHTML = '<div class="empty">Loading…</div>';
+  const noRate = m.properties.filter(p => !p.package_rate && !p.per_cleaning_price).length;
+  v.innerHTML = `
+    <div class="banner warn">These are the numbers that do not exist in any file you have given me yet.
+      Until they are filled in, <b>per-property and per-cleaning profit cannot be calculated.</b></div>
+    <div class="kpis">
+      ${kpi('Properties missing a rate', `${noRate} / ${m.properties.length}`, 'billing rate', noRate ? 'warn' : 'in')}
+      ${kpi('Cleaners missing pay', `${m.cleaners.filter(c => !c.pay_rate && !c.monthly_salary).length} / ${m.cleaners.length}`, 'per visit or salary', 'warn')}
+      ${kpi('Parties not mapped', `${m.parties.filter(p => !p.mapped_properties).length} / ${m.parties.length}`, 'to a property', 'warn')}
+      ${kpi('Hosts', String(m.hosts.length), `${m.hosts.filter(h => !h.phone).length} without a phone`)}
+    </div>
+    <div class="grid one">
+      ${card('Party → property mapping', 'biggest customers first — this unlocks per-property profit',
+             '<div id="mParty"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Property billing rates', 'what each property pays you', '<div id="mProp"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Cleaner pay rates', 'what each cleaner costs you', '<div id="mClean"></div>')}
+    </div>`;
+
+  $('#mParty').innerHTML = `<div style="max-height:46vh;overflow:auto"><table><thead><tr>
+    <th>Party</th><th class="num">Received from</th><th class="num">Entries</th>
+    <th>Mapped to property</th><th></th></tr></thead><tbody>
+    ${m.parties.slice(0, 80).map(p => `<tr>
+      <td><b>${esc(p.display_name)}</b><div class="sub">${esc(p.party_group || '')}</div></td>
+      <td class="num in">${p.money_in ? money(p.money_in, true) : '—'}</td>
+      <td class="num">${p.txns}</td>
+      <td><select data-party="${p.party_id}" style="width:100%;padding:5px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">
+        <option value="">— not mapped —</option>
+        ${m.properties.map(pr => `<option value="${pr.property_id}"
+          ${(p.mapped_properties || '').split(',').includes(pr.property_id) ? 'selected' : ''}>
+          ${esc(pr.property_id)} · ${esc(pr.name)}</option>`).join('')}
+      </select></td>
+      <td>${p.mapped_properties ? '<span class="tag rev">mapped</span>' : ''}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+  $('#mParty').querySelectorAll('[data-party]').forEach(s2 => s2.onchange = async e => {
+    const ids = e.target.value ? [e.target.value] : [];
+    await api('/api/masters/map-party', { party_id: +e.target.dataset.party, property_ids: ids });
+    toast(ids.length ? 'Mapped — existing entries back-filled' : 'Mapping removed');
+    loadAux(); refresh();
+  });
+
+  const numCell = (val, ds) =>
+    `<input type="number" step="0.01" value="${val ?? ''}" ${ds}
+      style="width:110px;padding:5px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">`;
+  $('#mProp').innerHTML = `<div style="max-height:46vh;overflow:auto"><table><thead><tr>
+    <th>ID</th><th>Property</th><th>Host</th><th>Package</th>
+    <th class="num">Monthly rate</th><th class="num">Per cleaning</th><th>Cleaner</th></tr></thead><tbody>
+    ${m.properties.map(p => `<tr>
+      <td class="mono">${esc(p.property_id)}</td>
+      <td><b>${esc(p.name)}</b>${p.active ? '' : ' <span class="tag">inactive</span>'}</td>
+      <td>${esc(p.host_name || '—')}</td>
+      <td>${esc(p.package_type || '—')}</td>
+      <td class="num">${numCell(p.package_rate, `data-prop="${p.property_id}" data-f="package_rate"`)}</td>
+      <td class="num">${numCell(p.per_cleaning_price, `data-prop="${p.property_id}" data-f="per_cleaning_price"`)}</td>
+      <td>${esc(p.cleaners || '—')}</td></tr>`).join('')}</tbody></table></div>`;
+  $('#mProp').querySelectorAll('[data-prop]').forEach(i => i.onchange = async e => {
+    await api('/api/masters/property', { property_id: e.target.dataset.prop,
+      [e.target.dataset.f]: e.target.value === '' ? null : Number(e.target.value) });
+    toast('Rate saved'); loadAux();
+  });
+
+  $('#mClean').innerHTML = `<table><thead><tr><th>Cleaner</th><th class="num">Properties</th>
+    <th>Pay type</th><th class="num">Per visit</th><th class="num">Monthly salary</th></tr></thead><tbody>
+    ${m.cleaners.map(c => `<tr>
+      <td><b>${esc(c.name)}</b></td><td class="num">${c.properties}</td>
+      <td><select data-clean="${c.cleaner_id}" data-f="pay_type"
+        style="padding:5px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">
+        <option value="">—</option>
+        <option value="per_visit" ${c.pay_type === 'per_visit' ? 'selected' : ''}>Per visit</option>
+        <option value="monthly_salary" ${c.pay_type === 'monthly_salary' ? 'selected' : ''}>Monthly salary</option>
+      </select></td>
+      <td class="num">${numCell(c.pay_rate, `data-clean="${c.cleaner_id}" data-f="pay_rate"`)}</td>
+      <td class="num">${numCell(c.monthly_salary, `data-clean="${c.cleaner_id}" data-f="monthly_salary"`)}</td>
+    </tr>`).join('')}</tbody></table>`;
+  $('#mClean').querySelectorAll('[data-clean]').forEach(i => i.onchange = async e => {
+    const f = e.target.dataset.f;
+    await api('/api/masters/cleaner', { cleaner_id: +e.target.dataset.clean,
+      [f]: e.target.value === '' ? null : (f === 'pay_type' ? e.target.value : Number(e.target.value)) });
+    toast('Saved'); loadAux();
+  });
+  wire(v);
+};
+
+V.team = async () => {
+  const v = $('#view');
+  if (!S.user.perms.includes('finance.admin')) {
+    v.innerHTML = `<div class="grid one">${card('Your account', '', `
+      <form id="pwForm" class="form">
+        <div class="fld"><label>Current password</label><input name="current" type="password" required></div>
+        <div class="fld"><label>New password</label><input name="password" type="password" minlength="8" required></div>
+        <div class="full"><button class="btn pri">Change my password</button></div></form>`)}</div>`;
+    $('#pwForm').onsubmit = async ev => { ev.preventDefault();
+      try { await api('/api/users/password', Object.fromEntries(new FormData(ev.target).entries()));
+        toast('Password changed — sign in again'); setTimeout(() => location.reload(), 1200); }
+      catch (e) { toast(e.message, true); } };
+    return;
+  }
+  const d = await api('/api/users');
+  v.innerHTML = `
+    <div class="banner ok">Everyone who opens the dashboard from another PC or phone needs their own login.
+      Give each person only what they need — Ritesh can post payments without being able to change rates.</div>
+    <div class="grid one">
+      ${card(`People with access (${d.users.length})`, '', `
+        <table><thead><tr><th>Person</th><th>Can do</th><th>Status</th>
+          <th>Last signed in</th><th>Actions</th></tr></thead><tbody>
+        ${d.users.map(u => `<tr>
+          <td><b>${esc(u.full_name || u.username)}</b>
+            <div class="sub mono">${esc(u.username)}${u.user_id === d.me ? ' · you' : ''}</div></td>
+          <td style="min-width:300px">${d.permissions.map(p => `
+            <label style="display:inline-flex;align-items:center;gap:4px;margin:2px 8px 2px 0;font-size:11.5px">
+              <input type="checkbox" data-perm="${p.key}" data-uid="${u.user_id}"
+                ${String(u.perms).split(',').includes(p.key) ? 'checked' : ''}
+                ${u.user_id === d.me && p.key === 'finance.admin' ? 'disabled' : ''}>
+              ${esc(p.key.replace('finance.', ''))}</label>`).join('')}</td>
+          <td><span class="tag ${u.active ? 'rev' : 'cost'}">${u.active ? 'active' : 'off'}</span>
+            ${u.live_sessions ? `<div class="sub">${u.live_sessions} signed in</div>` : ''}</td>
+          <td class="mono" style="font-size:11px">${esc(u.last_login || 'never')}</td>
+          <td style="white-space:nowrap">
+            <button class="btn" style="padding:3px 8px;font-size:11.5px" data-reset="${u.user_id}">Reset password</button>
+            ${u.user_id === d.me ? '' : `
+            <button class="btn" style="padding:3px 8px;font-size:11.5px" data-toggle-u="${u.user_id}" data-on="${u.active}">${u.active ? 'Switch off' : 'Switch on'}</button>
+            <button class="btn danger" style="padding:3px 8px;font-size:11.5px" data-del="${u.user_id}">×</button>`}
+          </td></tr>`).join('')}</tbody></table>`)}
+    </div>
+    <div class="grid" style="margin-top:12px">
+      ${card('Add someone', '', `
+        <form id="uForm" class="form">
+          <div class="fld"><label>Full name</label><input name="fullName" placeholder="e.g. Ritesh"></div>
+          <div class="fld"><label>Username *</label><input name="username" required placeholder="ritesh"></div>
+          <div class="fld"><label>Password *</label><input name="password" type="password" minlength="8" required
+            placeholder="at least 8 characters"></div>
+          <div class="fld full"><label>What they can do</label>
+            <div>${d.permissions.map(p => `
+              <label style="display:inline-flex;align-items:center;gap:5px;margin:3px 12px 3px 0;font-size:12px">
+                <input type="checkbox" name="perm" value="${p.key}" ${p.key === 'finance.view' ? 'checked' : ''}>
+                <span><b>${esc(p.key.replace('finance.', ''))}</b> — ${esc(p.label)}</span></label>`).join('')}</div></div>
+          <div class="full"><button class="btn pri">Create login</button></div>
+        </form>`)}
+      ${card('My password', '', `
+        <form id="pwForm" class="form">
+          <div class="fld"><label>Current password</label><input name="current" type="password" required></div>
+          <div class="fld"><label>New password</label><input name="password" type="password" minlength="8" required></div>
+          <div class="full"><button class="btn">Change my password</button></div></form>`)}
+    </div>`;
+
+  v.querySelectorAll('[data-perm]').forEach(cb => cb.onchange = async () => {
+    const uid = +cb.dataset.uid;
+    const perms = [...v.querySelectorAll(`[data-uid="${uid}"]:checked`)].map(x => x.dataset.perm).join(',');
+    try { await api('/api/users/update', { user_id: uid, perms }); toast('Permissions saved'); }
+    catch (e) { toast(e.message, true); cb.checked = !cb.checked; }
+  });
+  v.querySelectorAll('[data-toggle-u]').forEach(b => b.onclick = async () => {
+    try { await api('/api/users/update', { user_id: +b.dataset.toggleU, active: b.dataset.on !== '1' });
+      toast('Updated'); render(); } catch (e) { toast(e.message, true); }
+  });
+  v.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('Remove this login? Entries they posted stay in the ledger.')) return;
+    try { await api('/api/users/delete', { user_id: +b.dataset.del }); toast('Removed'); render(); }
+    catch (e) { toast(e.message, true); }
+  });
+  v.querySelectorAll('[data-reset]').forEach(b => b.onclick = async () => {
+    const pw = prompt('New password for this person (at least 8 characters):');
+    if (!pw) return;
+    try { await api('/api/users/password', { user_id: +b.dataset.reset, password: pw });
+      toast('Password reset — they must sign in again'); } catch (e) { toast(e.message, true); }
+  });
+  $('#uForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const perms = fd.getAll('perm').join(',');
+    try {
+      await api('/api/users/create', { username: fd.get('username'), fullName: fd.get('fullName'),
+        password: fd.get('password'), perms });
+      toast('Login created'); render();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#pwForm').onsubmit = async ev => {
+    ev.preventDefault();
+    try { await api('/api/users/password', Object.fromEntries(new FormData(ev.target).entries()));
+      toast('Password changed — sign in again'); setTimeout(() => location.reload(), 1200); }
+    catch (e) { toast(e.message, true); }
+  };
+  wire(v);
+};
+
+V.quality = async () => {
+  const v = $('#view'), g = S.gaps;
+  const bar = (n, d) => `<div class="bar-mini"><i style="width:${d ? (n / d * 100).toFixed(0) : 0}%"></i></div>`;
+  v.innerHTML = `
+    <div class="grid">
+      ${card('What this system cannot answer yet', 'and exactly why', `
+        <table><tbody>
+        <tr><td>Revenue traceable to a property</td>
+            <td class="num"><b>${(100 - g.revenueUnattributedPct).toFixed(1)}%</b>${bar(g.revenueTotal - g.revenueUnattributed, g.revenueTotal)}</td></tr>
+        <tr><td>Parties mapped to a property</td>
+            <td class="num"><b>${g.partiesTotal - g.partiesUnmapped} / ${g.partiesTotal}</b>${bar(g.partiesTotal - g.partiesUnmapped, g.partiesTotal)}</td></tr>
+        <tr><td>Properties with a billing rate</td>
+            <td class="num"><b>${g.propertiesTotal - g.propertiesNoRate} / ${g.propertiesTotal}</b>${bar(g.propertiesTotal - g.propertiesNoRate, g.propertiesTotal)}</td></tr>
+        <tr><td>Cleaners with a pay rate</td>
+            <td class="num"><b>${g.cleanersTotal - g.cleanersNoRate} / ${g.cleanersTotal}</b>${bar(g.cleanersTotal - g.cleanersNoRate, g.cleanersTotal)}</td></tr>
+        <tr><td>Opening bank balance</td><td class="num">${g.openingBalanceSet ? '<span class="in">set</span>' : '<span class="out">not set</span>'}</td></tr>
+        <tr><td>Books current to</td><td class="num mono">${esc(g.lastTxnDate || '—')}</td></tr>
+        </tbody></table>`)}
+      ${card('Open flags by type', '', '<div id="qFlags"></div>', { dim:'category', title:'Open flags', chart:'rank', filter:{flaggedOnly:true} })}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Change log', 'every edit, who made it and what changed', '<div id="qAudit">Loading…</div>')}
+    </div>`;
+  const byType = {};
+  for (const f of S.flags) byType[f.flag_type] = (byType[f.flag_type] || 0) + 1;
+  CH.rankBars($('#qFlags'), Object.entries(byType).map(([k, n]) =>
+    ({ key: k.replace(/_/g, ' '), gross: n, txns: n })), { field:'gross', color:'var(--saffron)' });
+  const a = await api('/api/audit');
+  $('#qAudit').innerHTML = `<div style="max-height:46vh;overflow:auto"><table><thead><tr>
+    <th>When</th><th>Who</th><th>What</th><th>Field</th><th>Change</th><th>Note</th></tr></thead><tbody>
+    ${a.map(h => `<tr><td class="mono">${esc(h.ts)}</td><td>${esc(h.actor)}</td>
+      <td>${esc(h.table_name)} ${esc(h.row_id || '')}</td><td>${esc(h.field || h.action)}</td>
+      <td class="mono">${h.old_value != null ? esc(h.old_value) + ' → ' : ''}${esc(h.new_value ?? '')}</td>
+      <td style="color:var(--muted);max-width:340px">${esc(h.note || '')}</td></tr>`).join('')}
+    </tbody></table></div>`;
+  wire(v);
+};
+
+/* ================================================================== boot  */
+async function loadAux() {
+  [S.masters, S.out, S.flags, S.gaps] = await Promise.all([
+    api('/api/masters'), api('/api/outstanding'), api('/api/flags'), api('/api/gaps'),
+  ]);
+}
+async function refresh() {
+  renderChips();
+  S.data = await api('/api/analytics', { filter: S.filter,
+    dims: ['category','party','property','voucher_type','cost_behaviour','host','source'] });
+  const [out, flags, gaps] = await Promise.all([
+    api('/api/outstanding'), api('/api/flags'), api('/api/gaps')]);
+  Object.assign(S, { out, flags, gaps });
+  S.dupeCount = flags.filter(f => f.flag_type === 'possible_duplicate').length;
+  render();
+}
+function render() { (V[S.tab] || V.overview)(); }
+
+function loginScreen(setup) {
+  app.innerHTML = `<div class="login">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">${MARK}
+      <div class="brandname"><b>Swabha</b><small>FINANCIAL CONTROL</small></div></div>
+    <h1>${setup ? 'Create your login' : 'Sign in'}</h1>
+    <p>${setup ? 'First time here — choose a username and password. You can add your team later.'
+               : 'Enter your Swabha finance login.'}</p>
+    <form id="lf">
+      ${setup ? `<div class="fld"><label>Your name</label><input name="fullName" placeholder="e.g. Swabha Owner"></div>` : ''}
+      <div class="fld"><label>Username</label><input name="username" required autocomplete="username"></div>
+      <div class="fld"><label>Password</label><input name="password" type="password" required
+        autocomplete="${setup ? 'new-password' : 'current-password'}"
+        ${setup ? 'minlength="8" placeholder="at least 8 characters"' : ''}></div>
+      <button class="btn pri" style="width:100%;margin-top:6px">${setup ? 'Create and sign in' : 'Sign in'}</button>
+      <div class="err hide" id="lerr"></div>
+    </form></div>`;
+  $('#lf').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    try { await api(setup ? '/api/setup' : '/api/login', b); boot(); }
+    catch (e) { const el = $('#lerr'); el.textContent = e.message; el.classList.remove('hide'); }
+  };
+}
+
+async function boot() {
+  applyTheme();
+  const me = await api('/api/me');
+  if (!me.user) return loginScreen(me.setupNeeded);
+  S.user = me.user;
+  S.opts = await api('/api/options');
+  if (!S.filter.from) { S.filter.from = S.opts.dateRange.min; S.filter.to = S.opts.dateRange.max; }
+  await loadAux();
+  shell(); renderSlicers(); await refresh();
+}
+window.addEventListener('resize', () => { clearTimeout(window.__rz);
+  window.__rz = setTimeout(() => S.data && render(), 220); });
+boot().catch(e => { app.innerHTML = `<div class="empty">Could not start: ${esc(e.message)}</div>`; });
