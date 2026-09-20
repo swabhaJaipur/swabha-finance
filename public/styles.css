@@ -197,6 +197,23 @@ textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:
   display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .sp-flex{flex:1}
 
+/* property multi-select checklists (Add Entry + edit-entry popup) */
+.prop-ck-toolbar{display:flex;gap:8px;margin-bottom:6px}
+.prop-ck-toolbar input{flex:1;min-width:0}
+.prop-ck-toolbar .btn{padding:6px 10px;font-size:12px;white-space:nowrap;flex:none}
+.prop-ck-list{max-height:200px;overflow:auto;border:1px solid var(--line);border-radius:8px;
+  padding:6px;columns:2;column-gap:4px}
+.prop-ck-item,.prop-ck-admin{display:flex;align-items:center;gap:8px;font-size:13.5px;
+  break-inside:avoid;cursor:pointer;padding:7px 8px;border-radius:6px;line-height:1.3}
+.prop-ck-item:hover,.prop-ck-admin:hover{background:var(--chip)}
+.prop-ck-admin{font-weight:600;background:var(--chip);margin-bottom:4px}
+.prop-ck-item input,.prop-ck-admin input{flex:none;width:16px;height:16px;cursor:pointer}
+.propmode-toggle{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.propmode-opt{display:flex;align-items:center;gap:7px;font-size:13.5px;font-weight:normal;
+  cursor:pointer;padding:8px 12px;border:1px solid var(--line);border-radius:8px;flex:1;min-width:200px}
+.propmode-opt:has(input:checked){border-color:var(--water);background:var(--chip);font-weight:600}
+.propmode-opt input{flex:none;width:16px;height:16px;cursor:pointer}
+
 /* ---------- mobile ---------- */
 @media (max-width:760px){
   .wrap{padding:10px}
@@ -251,6 +268,11 @@ textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:
   .login{margin:6vh 12px;padding:20px}
   .lan{flex-wrap:wrap}
   .lan code{word-break:break-all}
+  /* property checklists: single column, bigger tap targets, toolbar stacks */
+  .prop-ck-list{columns:1;max-height:45vh}
+  .prop-ck-toolbar{flex-wrap:wrap}
+  .prop-ck-toolbar input{flex:1 1 100%}
+  .prop-ck-item,.prop-ck-admin{padding:9px 8px;font-size:14px}
 }
 @media (max-width:420px){
   .kpis{grid-template-columns:1fr}

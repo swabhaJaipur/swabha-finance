@@ -700,12 +700,26 @@ async function openTxn(id, onSaved) {
         ${f('CGST','cgst', t.cgst,'number','step=0.01')}
         ${f('SGST','sgst', t.sgst,'number','step=0.01')}
         ${f('IGST','igst', t.igst,'number','step=0.01')}
-        <div class="fld"><label>Property</label>
-          <input id="xPropField" list="xPropList" autocomplete="off"
-            value="${t.property_id ? esc(t.property_id + ' · ' + (S.masters?.properties || []).find(p => p.property_id === t.property_id)?.name) : ''}">
-          <input type="hidden" name="property_id" id="xPropHidden" value="${esc(t.property_id ?? '')}">
-          <datalist id="xPropList">${(S.masters?.properties || []).map(p =>
-            `<option value="${esc(p.property_id)} · ${esc(p.name)}">`).join('')}</datalist></div>
+        <div class="fld full">
+          <label>Property <span class="note">— tick one, or several to split this entry's amount evenly between them</span></label>
+          <div class="prop-ck-toolbar">
+            <input id="xPropSearch" autocomplete="off" placeholder="type to filter…">
+            <button type="button" class="btn" data-propck-all>Select all</button>
+            <button type="button" class="btn" data-propck-none>Clear</button>
+          </div>
+          <div id="xPropCkList" class="prop-ck-list">
+            <label data-prop-label="admin / company overhead" class="prop-ck-admin">
+              <input type="checkbox" class="xMultiPropCk" value="ADMIN" ${t.property_id === 'ADMIN' ? 'checked' : ''}>
+              Admin / company overhead (no property)
+            </label>
+            ${(S.masters?.properties || []).filter(p => p.property_id !== 'ADMIN').map(p => {
+              const label = `${p.property_id} · ${p.name}`;
+              return `<label data-prop-label="${esc(label.toLowerCase())}" class="prop-ck-item">
+                <input type="checkbox" class="xMultiPropCk" value="${p.property_id}" ${t.property_id === p.property_id ? 'checked' : ''}> ${esc(label)}</label>`;
+            }).join('')}
+          </div>
+          <div id="xPropNote" class="note" style="margin-top:4px"></div>
+        </div>
         ${f('Paid by','payment_mode', t.payment_mode)}
         <div class="fld full"><label>Note</label><input name="narration" value="${esc(t.narration ?? '')}"></div>
       </form>
@@ -721,10 +735,27 @@ async function openTxn(id, onSaved) {
       <button class="btn pri" id="xSave">Save changes</button></footer></div>`;
   document.body.append(host);
   smartField($('#xCatField', host));
-  smartField($('#xPropField', host), val => {
-    const m = (S.masters?.properties || []).find(p => `${p.property_id} · ${p.name}` === val);
-    $('#xPropHidden', host).value = m ? m.property_id : '';
-  });
+  const xPropSearch = $('#xPropSearch', host), xPropCkList = $('#xPropCkList', host), xPropNote = $('#xPropNote', host);
+  const xPropChecks = () => [...host.querySelectorAll('.xMultiPropCk')];
+  xPropSearch.oninput = () => {
+    const q = xPropSearch.value.trim().toLowerCase();
+    xPropCkList.querySelectorAll('label[data-prop-label]').forEach(l => {
+      l.style.display = l.dataset.propLabel.includes(q) ? '' : 'none';
+    });
+  };
+  const updateXPropNote = () => {
+    const n = xPropChecks().filter(c => c.checked).length;
+    xPropNote.textContent = n >= 2
+      ? `Will split this entry's amount evenly across ${n} properties — the original entry is updated and ${n - 1} new one${n > 2 ? 's' : ''} posted alongside it`
+      : '';
+  };
+  host.addEventListener('change', e => { if (e.target.classList.contains('xMultiPropCk')) updateXPropNote(); });
+  $('[data-propck-all]', host).onclick = () => {
+    xPropChecks().forEach(c => { if (c.closest('label').style.display !== 'none') c.checked = true; });
+    updateXPropNote();
+  };
+  $('[data-propck-none]', host).onclick = () => { xPropChecks().forEach(c => c.checked = false); updateXPropNote(); };
+  updateXPropNote();
   const close = () => { host.remove(); MODAL_DEPTH = Math.max(0, MODAL_DEPTH - 1); };
   host.onclick = e => { if (e.target === host) close(); };
   host.addEventListener('keydown', e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
@@ -737,10 +768,31 @@ async function openTxn(id, onSaved) {
     const fd = new FormData($('#xForm', host));
     const changes = {};
     for (const [k, v] of fd.entries()) changes[k] = v === '' ? null : v;
+    const propIds = xPropChecks().filter(c => c.checked).map(c => c.value);
     try {
-      const r = await api('/api/txn/update', { txn_id: id, changes });
-      close();
-      toast(r.updated ? `Saved — ${r.updated} field${r.updated > 1 ? 's' : ''} changed` : 'No changes to save');
+      if (propIds.length >= 2) {
+        const total = Number(changes.gross_amount ?? t.gross_amount);
+        const share = Math.round((total / propIds.length) * 100) / 100;
+        changes.gross_amount = share;
+        changes.property_id = propIds[0];
+        const r = await api('/api/txn/update', { txn_id: id, changes });
+        for (let i = 1; i < propIds.length; i++) {
+          await api('/api/txn/create', {
+            txn_date: changes.txn_date ?? t.txn_date, direction: changes.direction ?? t.direction,
+            gross_amount: share, category: changes.category ?? t.category, party: t.party,
+            property_id: propIds[i], payment_mode: changes.payment_mode ?? t.payment_mode,
+            voucher_no: changes.voucher_no || t.voucher_no || `SPLIT-${id}`,
+            narration: `${changes.narration ?? t.narration ?? ''} (split ${i+1}/${propIds.length}, from entry #${id})`.trim(),
+          });
+        }
+        close();
+        toast(`Saved — split across ${propIds.length} properties, ${propIds.length - 1} new ${propIds.length - 1 > 1 ? 'entries' : 'entry'} created`);
+      } else {
+        changes.property_id = propIds[0] || null;
+        const r = await api('/api/txn/update', { txn_id: id, changes });
+        close();
+        toast(r.updated ? `Saved — ${r.updated} field${r.updated > 1 ? 's' : ''} changed` : 'No changes to save');
+      }
       if (typeof onSaved === 'function') await onSaved();   // redraw the drill-down behind it
       else refresh();
     } catch (e) { toast(e.message, true); }
@@ -1075,11 +1127,11 @@ V.entry = () => {
 
       <div class="fld full">
         <label>This entry is for *</label>
-        <div style="display:flex;gap:14px;margin-bottom:8px">
-          <label style="display:flex;align-items:center;gap:5px;font-size:13px;font-weight:normal;cursor:pointer">
+        <div class="propmode-toggle">
+          <label class="propmode-opt">
             <input type="radio" name="propMode" value="property" checked> Specific propert(ies)
           </label>
-          <label style="display:flex;align-items:center;gap:5px;font-size:13px;font-weight:normal;cursor:pointer">
+          <label class="propmode-opt">
             <input type="radio" name="propMode" value="admin"> Admin / company overhead (no property)
           </label>
         </div>
@@ -1088,11 +1140,13 @@ V.entry = () => {
           <label style="font-weight:normal">Property <button type="button" class="btn" id="addPropBtn"
             style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button>
             <span class="note">— tick one, or several to split the amount evenly between them</span></label>
-          <input id="propSearch" autocomplete="off" placeholder="type to filter…" style="margin-bottom:6px">
-          <div id="propCkList" style="max-height:180px;overflow:auto;
-            border:1px solid var(--line);border-radius:6px;padding:8px;columns:2">
-            ${props.filter(p => p.property_id !== 'ADMIN').map(p => `<label data-prop-label="${esc(propLabel(p).toLowerCase())}"
-                style="display:block;font-size:13px;margin:3px 0;break-inside:avoid;cursor:pointer">
+          <div class="prop-ck-toolbar">
+            <input id="propSearch" autocomplete="off" placeholder="type to filter…">
+            <button type="button" class="btn" data-propck-all>Select all</button>
+            <button type="button" class="btn" data-propck-none>Clear</button>
+          </div>
+          <div id="propCkList" class="prop-ck-list">
+            ${props.filter(p => p.property_id !== 'ADMIN').map(p => `<label data-prop-label="${esc(propLabel(p).toLowerCase())}" class="prop-ck-item">
               <input type="checkbox" class="multiPropCk" value="${p.property_id}"> ${esc(propLabel(p))}</label>`).join('')}
           </div>
           <div id="propSelectedNote" class="note" style="margin-top:4px"></div>
@@ -1140,6 +1194,11 @@ V.entry = () => {
     propNote.textContent = n >= 2 ? `Will split evenly across ${n} properties` : '';
   };
   v.addEventListener('change', e => { if (e.target.classList.contains('multiPropCk')) updatePropNote(); });
+  $('[data-propck-all]', v).onclick = () => {
+    propChecks().forEach(c => { if (c.closest('label').style.display !== 'none') c.checked = true; });
+    updatePropNote();
+  };
+  $('[data-propck-none]', v).onclick = () => { propChecks().forEach(c => c.checked = false); updatePropNote(); };
   v.querySelectorAll('input[name=propMode]').forEach(r => r.onchange = () => {
     const isAdmin = v.querySelector('input[name=propMode]:checked').value === 'admin';
     propModeProperty.style.display = isAdmin ? 'none' : 'block';
