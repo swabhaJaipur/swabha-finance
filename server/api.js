@@ -1227,54 +1227,106 @@ const routes = {
 
   
   'POST /api/masters/party': (req, res, { body, user }) => {
-    if (!require('./auth').can(user, 'finance.edit')) return require('./api').fail(res, 403, 'no access');
-    const db = require('./db');
-    const { display_name, party_type } = body || {};
-    if (!display_name) return require('./api').fail(res, 400, 'party name required');
-    
+    if (!need(res, user, 'finance.edit')) return;
+    const { display_name, kind } = body || {};
+    if (!display_name) return fail(res, 400, 'party name required');
     try {
-      db.run('INSERT INTO parties (display_name, party_type) VALUES (?, ?)', 
-             [display_name, party_type || 'vendor']);
-      const party = db.get('SELECT * FROM parties WHERE display_name=? ORDER BY party_id DESC LIMIT 1', [display_name]);
-      require('./api').ok(res, { ok: true, party_id: party?.party_id });
+      run('INSERT INTO parties (display_name, kind, match_status) VALUES (?, ?, ?)',
+          [display_name, kind || 'vendor', 'confirmed']);
+      const party = get('SELECT * FROM parties WHERE display_name=?', [display_name]);
+      audit({ actor: user.username, table: 'parties', rowId: party?.party_id, action: 'insert',
+              note: `quick-added ${display_name}` });
+      ok(res, { ok: true, party_id: party?.party_id });
     } catch (e) {
-      require('./api').fail(res, 400, e.message);
+      fail(res, 400, e.message);
     }
   },
 
   'POST /api/masters/category': (req, res, { body, user }) => {
-    if (!require('./auth').can(user, 'finance.edit')) return require('./api').fail(res, 403, 'no access');
-    const db = require('./db');
+    if (!need(res, user, 'finance.edit')) return;
     const { name, kind } = body || {};
-    if (!name) return require('./api').fail(res, 400, 'category name required');
-    
+    if (!name) return fail(res, 400, 'category name required');
     try {
-      db.run('INSERT INTO categories (name, kind) VALUES (?, ?)', 
-             [name, kind || 'opex']);
-      const cat = db.get('SELECT * FROM categories WHERE name=? ORDER BY category_id DESC LIMIT 1', [name]);
-      require('./api').ok(res, { ok: true, category_id: cat?.category_id });
+      run('INSERT INTO categories (name, kind) VALUES (?, ?)',
+          [name, kind || 'opex']);
+      const cat = get('SELECT * FROM categories WHERE name=?', [name]);
+      audit({ actor: user.username, table: 'categories', rowId: cat?.category_id, action: 'insert',
+              note: `quick-added ${name}` });
+      ok(res, { ok: true, category_id: cat?.category_id });
     } catch (e) {
-      require('./api').fail(res, 400, e.message);
+      fail(res, 400, e.message);
     }
   },
 
-  'POST /api/masters/property': (req, res, { body, user }) => {
-    if (!require('./auth').can(user, 'finance.admin')) return require('./api').fail(res, 403, 'no access');
-    const db = require('./db');
-    const { name, host_name, property_id } = body || {};
-    if (!name || !host_name) return require('./api').fail(res, 400, 'property name & host required');
-    
+  // ------------------------------------------------------------- hosts CRUD
+  'POST /api/masters/host/create': (req, res, { body, user }) => {
+    if (!need(res, user, 'finance.masters')) return;
+    const { name, phone, email, notes } = body || {};
+    if (!name) return fail(res, 400, 'host name required');
+    if (get('SELECT 1 x FROM hosts WHERE name=?', [name])) return fail(res, 409, 'that host already exists');
     try {
-      const host = db.get('SELECT host_id FROM hosts WHERE name=?', [host_name]);
-      if (!host) return require('./api').fail(res, 404, `host "${host_name}" not found`);
-      
-      const pid = property_id || `P${Date.now().toString().slice(-6)}`;
-      db.run('INSERT INTO properties (property_id, name, host_id, active) VALUES (?, ?, ?, 1)', 
-             [pid, name, host.host_id]);
-      require('./api').ok(res, { ok: true, property_id: pid });
-    } catch (e) {
-      require('./api').fail(res, 400, e.message);
-    }
+      run(`INSERT INTO hosts(name, phone, email, notes, active, joined_date)
+           VALUES(?,?,?,?,1,date('now'))`, [name, phone || null, email || null, notes || null]);
+      const h = get('SELECT * FROM hosts WHERE name=?', [name]);
+      audit({ actor: user.username, table: 'hosts', rowId: h.host_id, action: 'insert', note: `added host ${name}` });
+      ok(res, { ok: true, host: h });
+    } catch (e) { fail(res, 400, e.message); }
+  },
+
+  'POST /api/masters/host/update': (req, res, { body, user }) => {
+    if (!need(res, user, 'finance.masters')) return;
+    const { host_id, name, phone, email, notes, active } = body || {};
+    const cur = get('SELECT * FROM hosts WHERE host_id=?', [host_id]);
+    if (!cur) return fail(res, 404, 'unknown host');
+    tx(() => {
+      for (const [k, v] of Object.entries({ name, phone, email, notes, active })) {
+        if (v === undefined) continue;
+        if (String(cur[k] ?? '') === String(v ?? '')) continue;
+        run(`UPDATE hosts SET ${k}=? WHERE host_id=?`, [v, host_id]);
+        audit({ actor: user.username, table: 'hosts', rowId: host_id, field: k,
+                oldValue: cur[k], newValue: v, action: 'update' });
+      }
+    });
+    ok(res, get('SELECT * FROM hosts WHERE host_id=?', [host_id]));
+  },
+
+  // --------------------------------------------------------- properties CRUD
+  'POST /api/masters/property/create': (req, res, { body, user }) => {
+    if (!need(res, user, 'finance.masters')) return;
+    const { property_id, name, host_id, type, city, bedrooms, bathrooms, max_guests,
+            package_type, package_rate, per_cleaning_price, cleanings_included, notes } = body || {};
+    if (!name || !host_id) return fail(res, 400, 'property name & host required');
+    const host = get('SELECT host_id FROM hosts WHERE host_id=?', [host_id]);
+    if (!host) return fail(res, 404, 'unknown host');
+    const pid = property_id || `P${Date.now().toString().slice(-6)}`;
+    if (get('SELECT 1 x FROM properties WHERE property_id=?', [pid])) return fail(res, 409, 'that property ID already exists');
+    try {
+      run(`INSERT INTO properties(property_id,name,host_id,type,city,bedrooms,bathrooms,max_guests,
+             onboarding_date,package_type,package_rate,per_cleaning_price,cleanings_included,active,notes)
+           VALUES(?,?,?,?,?,?,?,?,date('now'),?,?,?,?,1,?)`,
+          [pid, name, host_id, type || null, city || null, bedrooms || null, bathrooms || null,
+           max_guests || null, package_type || null, package_rate || null, per_cleaning_price || null,
+           cleanings_included || null, notes || null]);
+      audit({ actor: user.username, table: 'properties', rowId: pid, action: 'insert', note: `added property ${name}` });
+      ok(res, { ok: true, property_id: pid });
+    } catch (e) { fail(res, 400, e.message); }
+  },
+
+  'POST /api/masters/property/edit': (req, res, { body, user }) => {
+    if (!need(res, user, 'finance.masters')) return;
+    const { property_id, name, type, city, bedrooms, bathrooms, max_guests, host_id, active, notes } = body || {};
+    const cur = get('SELECT * FROM properties WHERE property_id=?', [property_id]);
+    if (!cur) return fail(res, 404, 'unknown property');
+    tx(() => {
+      for (const [k, v] of Object.entries({ name, type, city, bedrooms, bathrooms, max_guests, host_id, active, notes })) {
+        if (v === undefined) continue;
+        if (String(cur[k] ?? '') === String(v ?? '')) continue;
+        run(`UPDATE properties SET ${k}=? WHERE property_id=?`, [v, property_id]);
+        audit({ actor: user.username, table: 'properties', rowId: property_id, field: k,
+                oldValue: cur[k], newValue: v, action: 'update' });
+      }
+    });
+    ok(res, get('SELECT * FROM properties WHERE property_id=?', [property_id]));
   },
 
 

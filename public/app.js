@@ -2253,6 +2253,12 @@ V.masters = () => {
       ${kpi('Hosts', String(m.hosts.length), `${m.hosts.filter(h => !h.phone).length} without a phone`)}
     </div>
     <div class="grid one">
+      ${card('Hosts', 'add a host, or edit name / phone / email / active', '<div id="mHosts"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
+      ${card('Properties', 'add a property, or edit its details and billing rate', '<div id="mProps"></div>')}
+    </div>
+    <div class="grid one" style="margin-top:12px">
       ${card('Party → property mapping', 'biggest customers first — this unlocks per-property profit',
              '<div id="mParty"></div>')}
     </div>
@@ -2262,6 +2268,73 @@ V.masters = () => {
     <div class="grid one" style="margin-top:12px">
       ${card('Cleaner pay rates', 'what each cleaner costs you', '<div id="mClean"></div>')}
     </div>`;
+
+  const txt = (val, ds) => `<input type="text" value="${val ?? ''}" ${ds}
+      style="width:100%;padding:5px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">`;
+
+  $('#mHosts').innerHTML = `<div style="max-height:40vh;overflow:auto"><table><thead><tr>
+    <th>Name</th><th>Phone</th><th>Email</th><th>Active</th></tr></thead><tbody>
+    ${m.hosts.map(h => `<tr>
+      <td>${txt(h.name, `data-host="${h.host_id}" data-f="name"`)}</td>
+      <td>${txt(h.phone, `data-host="${h.host_id}" data-f="phone"`)}</td>
+      <td>${txt(h.email, `data-host="${h.host_id}" data-f="email"`)}</td>
+      <td><input type="checkbox" data-host="${h.host_id}" data-f="active" ${h.active ? 'checked' : ''}></td>
+    </tr>`).join('')}</tbody></table></div>
+    <form id="hostAddForm" class="form" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="fld"><label>New host name *</label><input name="name" required placeholder="e.g. Riya Sharma"></div>
+      <div class="fld"><label>Phone</label><input name="phone" placeholder="optional"></div>
+      <div class="fld"><label>Email</label><input name="email" placeholder="optional"></div>
+      <div class="full"><button class="btn pri" type="submit">Add host</button></div>
+    </form>`;
+  $('#mHosts').querySelectorAll('[data-host]').forEach(el => el.onchange = async e => {
+    const f = e.target.dataset.f;
+    const val = f === 'active' ? (e.target.checked ? 1 : 0) : e.target.value;
+    try { await api('/api/masters/host/update', { host_id: +e.target.dataset.host, [f]: val });
+      toast('Saved'); loadAux(); } catch (err) { toast(err.message, true); }
+  });
+  $('#hostAddForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    try { await api('/api/masters/host/create', b); toast('Host added'); ev.target.reset(); loadAux(); refresh(); }
+    catch (e) { toast(e.message, true); }
+  };
+
+  $('#mProps').innerHTML = `<div style="max-height:40vh;overflow:auto"><table><thead><tr>
+    <th>ID</th><th>Name</th><th>Type</th><th>City</th><th class="num">Bedrooms</th><th>Active</th></tr></thead><tbody>
+    ${m.properties.map(p => `<tr>
+      <td class="mono">${esc(p.property_id)}</td>
+      <td>${txt(p.name, `data-prop2="${p.property_id}" data-f="name"`)}</td>
+      <td>${txt(p.type, `data-prop2="${p.property_id}" data-f="type"`)}</td>
+      <td>${txt(p.city, `data-prop2="${p.property_id}" data-f="city"`)}</td>
+      <td class="num">${txt(p.bedrooms, `data-prop2="${p.property_id}" data-f="bedrooms"`)}</td>
+      <td><input type="checkbox" data-prop2="${p.property_id}" data-f="active" ${p.active ? 'checked' : ''}></td>
+    </tr>`).join('')}</tbody></table></div>
+    <form id="propAddForm" class="form" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="fld"><label>New property name *</label><input name="name" required placeholder="e.g. Sunrise Villa"></div>
+      <div class="fld"><label>Host *</label><select name="host_id" required>
+        <option value="">— select —</option>
+        ${m.hosts.map(h => `<option value="${h.host_id}">${esc(h.name)}</option>`).join('')}
+      </select></div>
+      <div class="fld"><label>Property ID</label><input name="property_id" placeholder="auto if blank"></div>
+      <div class="fld"><label>Type</label><input name="type" placeholder="studio / apartment / villa"></div>
+      <div class="fld"><label>City</label><input name="city" placeholder="optional"></div>
+      <div class="fld"><label>Bedrooms</label><input name="bedrooms" type="number"></div>
+      <div class="fld"><label>Package rate</label><input name="package_rate" type="number" step="0.01"></div>
+      <div class="fld"><label>Per cleaning price</label><input name="per_cleaning_price" type="number" step="0.01"></div>
+      <div class="full"><button class="btn pri" type="submit">Add property</button></div>
+    </form>`;
+  $('#mProps').querySelectorAll('[data-prop2]').forEach(el => el.onchange = async e => {
+    const f = e.target.dataset.f;
+    const val = f === 'active' ? (e.target.checked ? 1 : 0) : e.target.value;
+    try { await api('/api/masters/property/edit', { property_id: e.target.dataset.prop2, [f]: val });
+      toast('Saved'); loadAux(); } catch (err) { toast(err.message, true); }
+  });
+  $('#propAddForm').onsubmit = async ev => {
+    ev.preventDefault();
+    const b = Object.fromEntries(new FormData(ev.target).entries());
+    try { await api('/api/masters/property/create', b); toast('Property added'); ev.target.reset(); loadAux(); refresh(); }
+    catch (e) { toast(e.message, true); }
+  };
 
   $('#mParty').innerHTML = `<div style="max-height:46vh;overflow:auto"><table><thead><tr>
     <th>Party</th><th class="num">Received from</th><th class="num">Entries</th>
