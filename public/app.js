@@ -1074,24 +1074,39 @@ V.entry = () => {
       <datalist id="partyList">${S.opts.parties.map(p => `<option value="${esc(p.key)}">`).join('')}</datalist>
 
       <div class="fld full">
-        <label>Property <button type="button" class="btn" id="addPropBtn"
-          style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button>
-          <span class="note" style="font-weight:normal">— tick one, or several to split the amount evenly between them</span></label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;
-            padding:8px;margin-bottom:6px;border:1px solid var(--line);border-radius:6px;
-            background:var(--chip);cursor:pointer">
-          <input type="checkbox" class="multiPropCk" value="ADMIN">
-          Company overhead / admin — not tied to any property
-        </label>
-        <input id="propSearch" autocomplete="off" placeholder="or type to filter properties below…"
-          style="margin-bottom:6px">
-        <div id="propCkList" style="max-height:180px;overflow:auto;
-          border:1px solid var(--line);border-radius:6px;padding:8px;columns:2">
-          ${props.filter(p => p.property_id !== 'ADMIN').map(p => `<label data-prop-label="${esc(propLabel(p).toLowerCase())}"
-              style="display:block;font-size:13px;margin:3px 0;break-inside:avoid;cursor:pointer">
-            <input type="checkbox" class="multiPropCk" value="${p.property_id}"> ${esc(propLabel(p))}</label>`).join('')}
+        <label>This entry is for *</label>
+        <div style="display:flex;gap:14px;margin-bottom:8px">
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px;font-weight:normal;cursor:pointer">
+            <input type="radio" name="propMode" value="property" checked> Specific propert(ies)
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px;font-weight:normal;cursor:pointer">
+            <input type="radio" name="propMode" value="admin"> Admin / company overhead (no property)
+          </label>
         </div>
-        <div id="propSelectedNote" class="note" style="margin-top:4px"></div>
+
+        <div id="propModeProperty">
+          <label style="font-weight:normal">Property <button type="button" class="btn" id="addPropBtn"
+            style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button>
+            <span class="note">— tick one, or several to split the amount evenly between them</span></label>
+          <input id="propSearch" autocomplete="off" placeholder="type to filter…" style="margin-bottom:6px">
+          <div id="propCkList" style="max-height:180px;overflow:auto;
+            border:1px solid var(--line);border-radius:6px;padding:8px;columns:2">
+            ${props.filter(p => p.property_id !== 'ADMIN').map(p => `<label data-prop-label="${esc(propLabel(p).toLowerCase())}"
+                style="display:block;font-size:13px;margin:3px 0;break-inside:avoid;cursor:pointer">
+              <input type="checkbox" class="multiPropCk" value="${p.property_id}"> ${esc(propLabel(p))}</label>`).join('')}
+          </div>
+          <div id="propSelectedNote" class="note" style="margin-top:4px"></div>
+        </div>
+
+        <div id="propModeAdmin" style="display:none">
+          <label style="font-weight:normal">Admin / overhead head</label>
+          <select id="adminHead" style="width:100%">
+            <option value="ADMIN">General admin / overhead</option>
+          </select>
+          <div class="note" style="margin-top:4px">Use the Category field above for what it actually was
+            (Salaries, Rent, GST, etc.) — this just keeps it out of per-property profit and the
+            "unmapped revenue" warning, since it's a deliberate company-wide cost, not a gap.</div>
+        </div>
       </div>
 
       <div class="fld"><label>Paid by</label><select name="payment_mode">
@@ -1112,6 +1127,7 @@ V.entry = () => {
   $('#addPropBtn').onclick = () => createProperty();
 
   const propSearch = $('#propSearch'), propCkList = $('#propCkList'), propNote = $('#propSelectedNote');
+  const propModeProperty = $('#propModeProperty'), propModeAdmin = $('#propModeAdmin'), adminHead = $('#adminHead');
   const propChecks = () => [...v.querySelectorAll('.multiPropCk')];
   propSearch.oninput = () => {
     const q = propSearch.value.trim().toLowerCase();
@@ -1124,11 +1140,18 @@ V.entry = () => {
     propNote.textContent = n >= 2 ? `Will split evenly across ${n} properties` : '';
   };
   v.addEventListener('change', e => { if (e.target.classList.contains('multiPropCk')) updatePropNote(); });
+  v.querySelectorAll('input[name=propMode]').forEach(r => r.onchange = () => {
+    const isAdmin = v.querySelector('input[name=propMode]:checked').value === 'admin';
+    propModeProperty.style.display = isAdmin ? 'none' : 'block';
+    propModeAdmin.style.display = isAdmin ? 'block' : 'none';
+  });
 
   $('#eForm').onsubmit = async ev => {
     ev.preventDefault();
     const b = Object.fromEntries(new FormData(ev.target).entries());
-    const propIds = propChecks().filter(c => c.checked).map(c => c.value);
+    const isAdmin = b.propMode === 'admin';
+    delete b.propMode;
+    const propIds = isAdmin ? [adminHead.value] : propChecks().filter(c => c.checked).map(c => c.value);
     try {
       if (propIds.length >= 2) {
         const share = Math.round((Number(b.gross_amount) / propIds.length) * 100) / 100;
@@ -1148,6 +1171,7 @@ V.entry = () => {
       propSearch.value = '';
       propCkList.querySelectorAll('label[data-prop-label]').forEach(l => l.style.display = '');
       propNote.textContent = '';
+      propModeProperty.style.display = 'block'; propModeAdmin.style.display = 'none';
       refresh();
     } catch (e) { toast(e.message, true); }
   };
