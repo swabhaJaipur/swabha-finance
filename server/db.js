@@ -1,22 +1,39 @@
 // Data-access layer. Deliberately thin so the same API can sit on MySQL later
 // (LAN now -> Hostinger later) without touching route or query code.
-const Database = require('better-sqlite3');
+//
+// Node 22+ ships a built-in synchronous SQLite driver (node:sqlite) — prefer it
+// so there's nothing to native-compile. Older runtimes (e.g. Railway's Node 18
+// build image) fall back to the better-sqlite3 npm package, which has the same
+// prepare().all/get/run surface.
 const path = require('path');
+
+let db;
+let usingBuiltin = true;
+try {
+  const { DatabaseSync } = require('node:sqlite');
+  const DB_PATH_ = process.env.SWABHA_DB || path.join(__dirname, '..', 'db', 'swabha_finance.db');
+  db = new DatabaseSync(DB_PATH_);
+} catch {
+  usingBuiltin = false;
+  const Database = require('better-sqlite3');
+  const DB_PATH_ = process.env.SWABHA_DB || path.join(__dirname, '..', 'db', 'swabha_finance.db');
+  db = new Database(DB_PATH_);
+}
 
 const DB_PATH = process.env.SWABHA_DB || path.join(__dirname, '..', 'db', 'swabha_finance.db');
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');      // concurrent readers while one writer works
-db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000');
+db.exec('PRAGMA journal_mode = WAL');      // concurrent readers while one writer works
+db.exec('PRAGMA foreign_keys = ON');
+db.exec('PRAGMA busy_timeout = 5000');
 
 const all = (sql, params = []) => db.prepare(sql).all(...params);
 const get = (sql, params = []) => db.prepare(sql).get(...params);
 const run = (sql, params = []) => db.prepare(sql).run(...params);
 
 function tx(fn) {
-  const transaction = db.transaction(fn);
-  return transaction();
+  db.exec('BEGIN');
+  try { const r = fn(); db.exec('COMMIT'); return r; }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 
 // Nothing changes without a trace. The original Tally figure is always recoverable.
@@ -28,4 +45,4 @@ function audit({ actor, table, rowId, field, oldValue, newValue, action, note })
        newValue == null ? null : String(newValue), action, note ?? null]);
 }
 
-module.exports = { db, all, get, run, tx, audit, DB_PATH };
+module.exports = { db, all, get, run, tx, audit, DB_PATH, usingBuiltin };

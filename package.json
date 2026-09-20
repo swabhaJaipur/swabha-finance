@@ -8,10 +8,12 @@
     "dev": "node server/server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.18.2"
+  },
+  "optionalDependencies": {
     "better-sqlite3": "^9.2.2"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=22"
   }
 }
