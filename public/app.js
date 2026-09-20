@@ -133,6 +133,14 @@ async function createProperty(fieldEl) {
     S.masters.properties.push({ property_id: res.property_id, name, host_name: host.name });
     const dl = $('#propertyList'); if (dl) dl.insertAdjacentHTML('beforeend', `<option value="${esc(label)}">`);
     if (fieldEl) { fieldEl.value = label; fieldEl.dataset.prev = label; fieldEl.dispatchEvent(new Event('change')); }
+    // Add Entry's property picker is a checkbox list, not a field — tick the new one there too
+    const list = $('#propCkList');
+    if (list) {
+      list.insertAdjacentHTML('beforeend', `<label data-prop-label="${esc(label.toLowerCase())}"
+          style="display:block;font-size:13px;margin:3px 0;break-inside:avoid;cursor:pointer">
+        <input type="checkbox" class="multiPropCk" value="${res.property_id}" checked> ${esc(label)}</label>`);
+      list.lastElementChild.querySelector('input').dispatchEvent(new Event('change', { bubbles: true }));
+    }
     toast(`Added "${name}"`);
   } catch (e) { toast(e.message, true); }
 }
@@ -1065,21 +1073,25 @@ V.entry = () => {
         <input name="party" id="partyField" list="partyList" autocomplete="off" placeholder="click to search…"></div>
       <datalist id="partyList">${S.opts.parties.map(p => `<option value="${esc(p.key)}">`).join('')}</datalist>
 
-      <div class="fld"><label>Property <button type="button" class="btn" id="addPropBtn"
-        style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button></label>
-        <input id="propField" list="propertyList" autocomplete="off" placeholder="click to search, or leave blank">
-        <input type="hidden" name="property_id" id="propHidden"></div>
-      <datalist id="propertyList">${props.map(p => `<option value="${esc(propLabel(p))}">`).join('')}</datalist>
-
       <div class="fld full">
-        <label style="font-weight:normal;font-size:12.5px">
-          <input type="checkbox" id="multiPropToggle"> Split this entry evenly across several properties
+        <label>Property <button type="button" class="btn" id="addPropBtn"
+          style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button>
+          <span class="note" style="font-weight:normal">— tick one, or several to split the amount evenly between them</span></label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;
+            padding:8px;margin-bottom:6px;border:1px solid var(--line);border-radius:6px;
+            background:var(--chip);cursor:pointer">
+          <input type="checkbox" class="multiPropCk" value="ADMIN">
+          Company overhead / admin — not tied to any property
         </label>
-        <div id="multiPropList" style="display:none;max-height:170px;overflow:auto;
-          border:1px solid var(--line);border-radius:6px;padding:8px;margin-top:6px;columns:2">
-          ${props.map(p => `<label style="display:block;font-size:12px;margin:2px 0;break-inside:avoid">
+        <input id="propSearch" autocomplete="off" placeholder="or type to filter properties below…"
+          style="margin-bottom:6px">
+        <div id="propCkList" style="max-height:180px;overflow:auto;
+          border:1px solid var(--line);border-radius:6px;padding:8px;columns:2">
+          ${props.filter(p => p.property_id !== 'ADMIN').map(p => `<label data-prop-label="${esc(propLabel(p).toLowerCase())}"
+              style="display:block;font-size:13px;margin:3px 0;break-inside:avoid;cursor:pointer">
             <input type="checkbox" class="multiPropCk" value="${p.property_id}"> ${esc(propLabel(p))}</label>`).join('')}
         </div>
+        <div id="propSelectedNote" class="note" style="margin-top:4px"></div>
       </div>
 
       <div class="fld"><label>Paid by</label><select name="payment_mode">
@@ -1093,46 +1105,49 @@ V.entry = () => {
         <span class="note" style="margin-left:10px">Saved as source <b>Manual</b> so it is never confused with Tally data.</span></div>
     </form>`)}</div>`;
 
-  const catField = $('#catField'), partyField = $('#partyField'), propField = $('#propField'), propHidden = $('#propHidden');
+  const catField = $('#catField'), partyField = $('#partyField');
   smartField(catField);
   smartField(partyField);
-  smartField(propField, val => {
-    const m = props.find(p => propLabel(p) === val);
-    propHidden.value = m ? m.property_id : '';
-  });
   $('#addCatBtn').onclick = () => createCategory(catField);
-  $('#addPropBtn').onclick = () => createProperty(propField);
+  $('#addPropBtn').onclick = () => createProperty();
 
-  const multiToggle = $('#multiPropToggle'), multiList = $('#multiPropList');
-  multiToggle.onchange = () => {
-    multiList.style.display = multiToggle.checked ? 'block' : 'none';
-    if (multiToggle.checked) { propField.value = ''; propHidden.value = ''; propField.disabled = true; }
-    else propField.disabled = false;
+  const propSearch = $('#propSearch'), propCkList = $('#propCkList'), propNote = $('#propSelectedNote');
+  const propChecks = () => [...v.querySelectorAll('.multiPropCk')];
+  propSearch.oninput = () => {
+    const q = propSearch.value.trim().toLowerCase();
+    propCkList.querySelectorAll('label[data-prop-label]').forEach(l => {
+      l.style.display = l.dataset.propLabel.includes(q) ? '' : 'none';
+    });
   };
+  const updatePropNote = () => {
+    const n = propChecks().filter(c => c.checked).length;
+    propNote.textContent = n >= 2 ? `Will split evenly across ${n} properties` : '';
+  };
+  v.addEventListener('change', e => { if (e.target.classList.contains('multiPropCk')) updatePropNote(); });
 
   $('#eForm').onsubmit = async ev => {
     ev.preventDefault();
     const b = Object.fromEntries(new FormData(ev.target).entries());
-    delete b.property_id; // re-derive below, either single or split
-    const multiIds = multiToggle.checked
-      ? [...v.querySelectorAll('.multiPropCk:checked')].map(c => c.value) : [];
+    const propIds = propChecks().filter(c => c.checked).map(c => c.value);
     try {
-      if (multiIds.length >= 2) {
-        const share = Math.round((Number(b.gross_amount) / multiIds.length) * 100) / 100;
+      if (propIds.length >= 2) {
+        const share = Math.round((Number(b.gross_amount) / propIds.length) * 100) / 100;
         const group = `SPLIT-${Date.now()}`;
-        for (let i = 0; i < multiIds.length; i++) {
-          await api('/api/txn/create', { ...b, gross_amount: share, property_id: multiIds[i],
+        for (let i = 0; i < propIds.length; i++) {
+          await api('/api/txn/create', { ...b, gross_amount: share, property_id: propIds[i],
             voucher_no: b.voucher_no || group,
-            narration: `${b.narration || ''} (split ${i+1}/${multiIds.length} across properties)`.trim() });
+            narration: `${b.narration || ''} (split ${i+1}/${propIds.length} across properties)`.trim() });
         }
-        toast(`Entry posted, split across ${multiIds.length} properties`);
+        toast(`Entry posted, split across ${propIds.length} properties`);
       } else {
-        await api('/api/txn/create', { ...b, property_id: propHidden.value || null });
+        await api('/api/txn/create', { ...b, property_id: propIds[0] || null });
         toast('Entry posted');
       }
       ev.target.reset();
       $('#eForm [name=txn_date]').value = new Date().toISOString().slice(0,10);
-      multiList.style.display = 'none'; propField.disabled = false;
+      propSearch.value = '';
+      propCkList.querySelectorAll('label[data-prop-label]').forEach(l => l.style.display = '');
+      propNote.textContent = '';
       refresh();
     } catch (e) { toast(e.message, true); }
   };
