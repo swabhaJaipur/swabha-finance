@@ -1,3 +1,4 @@
-db/backups/
 node_modules/
+db/backups/
 logs/
+*.log
