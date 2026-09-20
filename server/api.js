@@ -152,7 +152,7 @@ const routes = {
   },
 
   // edit a figure from the dashboard — old value preserved in audit_log forever
-  'POST /api/txn/bulk': (req, res, { body, user }) => {
+  'POST /api/txn/bulk-edit': (req, res, { body, user }) => {
     if (!need(res, user, 'finance.entry')) return;
     const { txns, action, value } = body || {};
     if (!Array.isArray(txns) || !txns.length || !action) return fail(res, 400, 'txns array and action required');

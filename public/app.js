@@ -30,6 +30,19 @@ async function api(path, body) {
   return j;
 }
 
+// Click a field -> it clears so you can type/search fresh. Click away without
+// finishing -> the previous value comes right back, nothing is ever lost.
+function smartField(el, onCommit) {
+  el.addEventListener('focus', () => { el.dataset.prev = el.value; el.value = ''; });
+  el.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (el.value.trim() === '') el.value = el.dataset.prev || '';
+      else el.dataset.prev = el.value;
+      if (onCommit) onCommit(el.value);
+    }, 150); // let a datalist option click register before we decide the field is "empty"
+  });
+}
+
 /* ============================================================ filter logic */
 // A chart click calls this. Because every visual reads S.filter, one click
 // re-cuts the entire dashboard — that is the "interlinked" behaviour.
@@ -79,59 +92,49 @@ function viewHostDetails(hostName) {
 // Toggle templates menu
 
 // Create new party/vendor inline
-async function createParty() {
-  const name = prompt('Enter vendor/party name:');
+// Adds a new party/category/property without reloading the page (so whatever
+// else you've already typed into the form stays put), and drops the new name
+// straight into the field + its datalist so you can carry on immediately.
+async function createParty(fieldEl) {
+  const name = (fieldEl && fieldEl.dataset.prev) || prompt('Enter vendor/party name:');
   if (!name) return;
-  
   try {
-    const res = await api('/api/masters/party', { display_name: name, party_type: 'vendor' });
-    if (res.ok) {
-      alert(`✓ Created: ${name}`);
-      refresh();
-    } else {
-      alert('Error: ' + res.error);
-    }
-  } catch (e) {
-    alert('Failed: ' + e.message);
-  }
+    const res = await api('/api/masters/party', { display_name: name, kind: 'vendor' });
+    S.opts.parties.push({ key: name });
+    const dl = $('#partyList'); if (dl) dl.insertAdjacentHTML('beforeend', `<option value="${esc(name)}">`);
+    if (fieldEl) { fieldEl.value = name; fieldEl.dataset.prev = name; }
+    toast(`Added "${name}"`);
+  } catch (e) { toast(e.message, true); }
 }
 
-// Create new category inline
-async function createCategory() {
-  const name = prompt('Enter category name:');
+async function createCategory(fieldEl) {
+  const name = (fieldEl && fieldEl.dataset.prev) || prompt('Enter category name:');
   if (!name) return;
-  
+  const kind = prompt('Kind — revenue, cogs, opex, capex, other or transfer?', 'opex') || 'opex';
   try {
-    const res = await api('/api/masters/category', { name: name, kind: 'opex' });
-    if (res.ok) {
-      alert(`✓ Created: ${name}`);
-      refresh();
-    } else {
-      alert('Error: ' + res.error);
-    }
-  } catch (e) {
-    alert('Failed: ' + e.message);
-  }
+    const res = await api('/api/masters/category', { name, kind });
+    S.opts.categories.push({ key: name, kind });
+    const dl = $('#categoryList'); if (dl) dl.insertAdjacentHTML('beforeend', `<option value="${esc(name)}">`);
+    if (fieldEl) { fieldEl.value = name; fieldEl.dataset.prev = name; }
+    toast(`Added "${name}"`);
+  } catch (e) { toast(e.message, true); }
 }
 
-// Create new property inline
-async function createProperty() {
-  const name = prompt('Enter property name:');
+async function createProperty(fieldEl) {
+  const name = (fieldEl && fieldEl.dataset.prev) || prompt('Enter property name:');
   if (!name) return;
-  const host = prompt('Enter host name:');
-  if (!host) return;
-  
+  const hosts = S.masters?.hosts || [];
+  const hostName = prompt(`Which host? (${hosts.map(h => h.name).join(', ')})`);
+  const host = hosts.find(h => h.name.toLowerCase() === (hostName || '').toLowerCase());
+  if (!host) { toast('Host not recognised — nothing created', true); return; }
   try {
-    const res = await api('/api/masters/property', { name: name, host_name: host });
-    if (res.ok) {
-      alert(`✓ Created: ${name}`);
-      refresh();
-    } else {
-      alert('Error: ' + res.error);
-    }
-  } catch (e) {
-    alert('Failed: ' + e.message);
-  }
+    const res = await api('/api/masters/property/create', { name, host_id: host.host_id });
+    const label = `${res.property_id} · ${name}`;
+    S.masters.properties.push({ property_id: res.property_id, name, host_name: host.name });
+    const dl = $('#propertyList'); if (dl) dl.insertAdjacentHTML('beforeend', `<option value="${esc(label)}">`);
+    if (fieldEl) { fieldEl.value = label; fieldEl.dataset.prev = label; fieldEl.dispatchEvent(new Event('change')); }
+    toast(`Added "${name}"`);
+  } catch (e) { toast(e.message, true); }
 }
 
 
@@ -309,7 +312,6 @@ function shell() {
   $('#assistantSend').onclick = askAssistant;
   $('#assistantInput').addEventListener('keydown', e => { if (e.key === 'Enter') askAssistant(); });
 
-  lanBar();
 }
 
 async function lanBar() {
@@ -545,10 +547,10 @@ async function openDrill(cfg) {
 function entriesTable(rows, allowBulk = true) {
   if (!rows.length) return '<div class="empty">No entries</div>';
   const bulkUI = allowBulk ? `
-    <div style="padding:10px;background:var(--chip);border-radius:8px;margin-bottom:10px;display:flex;gap:10px;align-items:center">
+    <div class="bulkbar">
       <label style="font-size:12px"><input type="checkbox" id="bulkSelectAll"> Select all (${rows.length})</label>
       <span id="bulkCount" style="color:var(--muted);font-size:12px"></span>
-      <div style="flex:1"></div>
+      <div class="sp-flex"></div>
       <select id="bulkAction" style="padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);font-size:12px">
         <option value="">Bulk actions…</option>
         <option value="category">Set category for selected</option>
@@ -559,22 +561,22 @@ function entriesTable(rows, allowBulk = true) {
     </div>
   ` : '';
 
-  return `<div>${bulkUI}<div style="max-height:52vh;overflow:auto"><table><thead><tr>
+  return `<div>${bulkUI}<div style="max-height:52vh;overflow:auto"><table class="responsive-table"><thead><tr>
     ${allowBulk ? '<th style="width:30px"><input type="checkbox" class="bulkCheck" data-all="1"></th>' : ''}
     <th>Date</th><th>Voucher</th><th>Party</th><th>Category</th><th>Property</th>
     <th class="num">Amount</th><th class="num">GST</th><th>Source</th><th></th><th></th></tr></thead><tbody>
     ${rows.map(r => `<tr class="click" data-txn="${r.txn_id}">
-      ${allowBulk ? `<td style="width:30px"><input type="checkbox" class="bulkCheck" data-txn="${r.txn_id}" style="cursor:pointer"></td>` : ''}
-      <td class="mono">${fmtDate(r.txn_date)}</td>
-      <td class="mono">${esc(r.voucher_no || '—')}</td>
-      <td>${esc(r.party || '—')}</td>
-      <td><span class="tag ${r.kind === 'revenue' ? 'rev' : r.kind === 'capex' ? 'cap' : 'cost'}">${esc(r.category || '—')}</span></td>
-      <td>${esc(r.property || '<span style="color:var(--muted-2)">unattributed</span>')}</td>
-      <td class="num ${r.direction === 'in' ? 'in' : 'out'}">${r.direction === 'in' ? '+' : '−'}${money(r.gross_amount, true).replace('₹','₹')}</td>
-      <td class="num">${r.gst ? money(r.gst) : '—'}</td>
-      <td><span class="tag ${r.source === 'Tally' ? 'tally' : 'manual'}">${esc(r.source || '?')}</span></td>
-      <td>${r.flags ? `<span class="tag flag">⚑ ${r.flags}</span>` : ''}</td>
-      <td><button class="btn rowedit" data-txn="${r.txn_id}"
+      ${allowBulk ? `<td style="width:30px" data-label=""><input type="checkbox" class="bulkCheck" data-txn="${r.txn_id}" style="cursor:pointer"></td>` : ''}
+      <td class="mono" data-label="Date">${fmtDate(r.txn_date)}</td>
+      <td class="mono" data-label="Voucher">${esc(r.voucher_no || '—')}</td>
+      <td data-label="Party">${esc(r.party || '—')}</td>
+      <td data-label="Category"><span class="tag ${r.kind === 'revenue' ? 'rev' : r.kind === 'capex' ? 'cap' : 'cost'}">${esc(r.category || '—')}</span></td>
+      <td data-label="Property">${r.property ? esc(r.property) : '<span style="color:var(--muted-2)">unattributed</span>'}</td>
+      <td class="num ${r.direction === 'in' ? 'in' : 'out'}" data-label="Amount">${r.direction === 'in' ? '+' : '−'}${money(r.gross_amount, true).replace('₹','₹')}</td>
+      <td class="num" data-label="GST">${r.gst ? money(r.gst) : '—'}</td>
+      <td data-label="Source"><span class="tag ${r.source === 'Tally' ? 'tally' : 'manual'}">${esc(r.source || '?')}</span></td>
+      <td data-label="">${r.flags ? `<span class="tag flag">⚑ ${r.flags}</span>` : ''}</td>
+      <td data-label=""><button class="btn rowedit" data-txn="${r.txn_id}"
             style="padding:2px 9px;font-size:11.5px">Edit</button></td>
     </tr>`).join('')}</tbody></table></div></div>`;
 }
@@ -618,35 +620,38 @@ function wireEntryRows(root, redraw = () => {}) {
     bulkApply.onclick = async () => {
       const action = bulkAction?.value;
       const txns = checks.filter(c => c.checked).map(c => +c.dataset.txn);
-      if (!txns.length) { alert('Select entries first'); return; }
-      if (!action) { alert('Select an action'); return; }
+      if (!txns.length) { toast('Select entries first', true); return; }
+      if (!action) { toast('Select an action', true); return; }
 
       try {
         if (action === 'category') {
-          const cat = prompt('Enter category name:', '');
+          const cat = await pickFromList('Set category', S.opts.categories.map(c => c.key));
           if (!cat) return;
-          await api('/api/txn/bulk', { txns, action: 'set_category', value: cat });
-          alert(`✓ ${txns.length} entries category updated`);
+          await api('/api/txn/bulk-edit', { txns, action: 'set_category', value: cat });
+          toast(`${txns.length} entries updated`);
           bulkAction.value = '';
           if (redraw) redraw();
           if (updateCount) updateCount();
         } else if (action === 'property') {
-          const prop = prompt('Enter property ID (or leave blank for none):', '');
-          await api('/api/txn/bulk', { txns, action: 'set_property', value: prop || null });
-          alert(`✓ ${txns.length} entries property updated`);
+          const opts = (S.masters?.properties || []).map(p => `${p.property_id} · ${p.name}`);
+          const picked = await pickFromList('Set property (leave blank to clear)', opts, true);
+          const prop = picked ? picked.split(' · ')[0] : null;
+          await api('/api/txn/bulk-edit', { txns, action: 'set_property', value: prop });
+          toast(`${txns.length} entries updated`);
           bulkAction.value = '';
           if (redraw) redraw();
           if (updateCount) updateCount();
         } else if (action === 'status') {
-          const status = confirm('Mark as POSTED? (Cancel = CLEARED)') ? 'Posted' : 'Cleared';
-          await api('/api/txn/bulk', { txns, action: 'set_status', value: status });
-          alert(`✓ ${txns.length} entries marked ${status}`);
+          const status = await pickFromList('Mark selected as', ['Posted', 'Cleared']);
+          if (!status) return;
+          await api('/api/txn/bulk-edit', { txns, action: 'set_status', value: status });
+          toast(`${txns.length} entries marked ${status}`);
           bulkAction.value = '';
           if (redraw) redraw();
           if (updateCount) updateCount();
         }
-      } catch (e) { 
-        alert('ERROR: ' + e.message);
+      } catch (e) {
+        toast('ERROR: ' + e.message, true);
       }
     };
   }
@@ -676,9 +681,9 @@ async function openTxn(id, onSaved) {
       <form id="xForm" class="form">
         ${f('Date','txn_date', t.txn_date,'date')}
         ${f('Voucher no','voucher_no', t.voucher_no)}
-        <div class="fld"><label>Category</label><select name="category">
-          ${cats.map(c => `<option ${c === d.txn.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}
-        </select></div>
+        <div class="fld"><label>Category</label>
+          <input name="category" id="xCatField" list="xCatList" autocomplete="off" value="${esc(t.category ?? '')}">
+          <datalist id="xCatList">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
         <div class="fld"><label>Direction</label><select name="direction">
           <option value="in" ${t.direction === 'in' ? 'selected' : ''}>Money in</option>
           <option value="out" ${t.direction === 'out' ? 'selected' : ''}>Money out</option></select></div>
@@ -687,12 +692,12 @@ async function openTxn(id, onSaved) {
         ${f('CGST','cgst', t.cgst,'number','step=0.01')}
         ${f('SGST','sgst', t.sgst,'number','step=0.01')}
         ${f('IGST','igst', t.igst,'number','step=0.01')}
-        <div class="fld"><label>Property</label><select name="property_id">
-          <option value="">— unattributed —</option>
-          ${(S.masters?.properties || []).map(p =>
-            `<option value="${p.property_id}" ${p.property_id === t.property_id ? 'selected' : ''}>
-              ${esc(p.property_id)} · ${esc(p.name)}</option>`).join('')}
-        </select></div>
+        <div class="fld"><label>Property</label>
+          <input id="xPropField" list="xPropList" autocomplete="off"
+            value="${t.property_id ? esc(t.property_id + ' · ' + (S.masters?.properties || []).find(p => p.property_id === t.property_id)?.name) : ''}">
+          <input type="hidden" name="property_id" id="xPropHidden" value="${esc(t.property_id ?? '')}">
+          <datalist id="xPropList">${(S.masters?.properties || []).map(p =>
+            `<option value="${esc(p.property_id)} · ${esc(p.name)}">`).join('')}</datalist></div>
         ${f('Paid by','payment_mode', t.payment_mode)}
         <div class="fld full"><label>Note</label><input name="narration" value="${esc(t.narration ?? '')}"></div>
       </form>
@@ -707,6 +712,11 @@ async function openTxn(id, onSaved) {
     <footer><button class="btn" id="xCancel">Cancel</button>
       <button class="btn pri" id="xSave">Save changes</button></footer></div>`;
   document.body.append(host);
+  smartField($('#xCatField', host));
+  smartField($('#xPropField', host), val => {
+    const m = (S.masters?.properties || []).find(p => `${p.property_id} · ${p.name}` === val);
+    $('#xPropHidden', host).value = m ? m.property_id : '';
+  });
   const close = () => { host.remove(); MODAL_DEPTH = Math.max(0, MODAL_DEPTH - 1); };
   host.onclick = e => { if (e.target === host) close(); };
   host.addEventListener('keydown', e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
@@ -735,6 +745,43 @@ function toast(msg, bad) {
     background:${bad ? 'var(--out)' : 'var(--ink)'};color:var(--panel);padding:10px 18px;border-radius:10px;
     font-weight:600;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.28)`;
   document.body.append(t); setTimeout(() => t.remove(), 2600);
+}
+
+// A searchable stand-in for prompt() — type to filter, click to pick, Esc/backdrop to cancel.
+// Resolves to the picked string, or null if cancelled/left blank.
+function pickFromList(title, options, allowBlank = false) {
+  return new Promise(resolve => {
+    const id = 'pick-' + Math.random().toString(36).slice(2);
+    const host = document.createElement('div');
+    host.className = 'modal';
+    host.style.zIndex = '500';
+    host.innerHTML = `<div class="sheet" style="max-width:420px">
+      <header><h3>${esc(title)}</h3></header>
+      <div class="form" style="padding:14px">
+        <div class="fld full"><label>Type to search</label>
+          <input id="${id}" list="${id}dl" autocomplete="off" placeholder="click to search…"
+            style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">
+          <datalist id="${id}dl">${options.map(o => `<option value="${esc(o)}">`).join('')}</datalist></div>
+        <div class="full" style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+          ${allowBlank ? '<button type="button" class="btn" id="pickClear">Clear</button>' : ''}
+          <button type="button" class="btn" id="pickCancel">Cancel</button>
+          <button type="button" class="btn pri" id="pickOk">OK</button>
+        </div>
+      </div></div>`;
+    document.body.append(host);
+    const input = host.querySelector('#' + id);
+    input.focus();
+    const done = val => { host.remove(); resolve(val); };
+    host.querySelector('#pickCancel').onclick = () => done(null);
+    if (allowBlank) host.querySelector('#pickClear').onclick = () => done('');
+    host.querySelector('#pickOk').onclick = () => {
+      if (!options.includes(input.value)) { toast('Pick one of the listed options', true); return; }
+      done(input.value);
+    };
+    input.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); host.querySelector('#pickOk').click(); }
+                              if (e.key === 'Escape') done(null); };
+    host.onclick = e => { if (e.target === host) done(null); };
+  });
 }
 
 /* ================================================================== views */
@@ -996,6 +1043,8 @@ V.txns = async () => {
 V.entry = () => {
   const v = $('#view');
   const cats = S.opts.categories;
+  const props = S.masters?.properties || [];
+  const propLabel = p => `${p.property_id} · ${p.name}`;
   v.innerHTML = `<div class="grid one">${card('Post a new entry',
     'goes straight into the live database — everyone on the network sees it immediately', `
     <form id="eForm" class="form">
@@ -1005,16 +1054,34 @@ V.entry = () => {
         <option value="in">Money in (received)</option>
         <option value="out" selected>Money out (paid)</option></select></div>
       <div class="fld"><label>Amount *</label><input name="gross_amount" type="number" step="0.01" required placeholder="0.00"></div>
-      <div class="fld"><label>Category *</label><select name="category">
-        ${cats.map(c => `<option value="${esc(c.key)}">${esc(c.key)} — ${esc(c.kind)}</option>`).join('')}
-      </select></div>
-      <div class="fld"><label>Party</label><input name="party" list="partyList" placeholder="customer or vendor"></div>
+
+      <div class="fld"><label>Category * <button type="button" class="btn" id="addCatBtn"
+        style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button></label>
+        <input name="category" id="catField" list="categoryList" required autocomplete="off"
+          placeholder="click to search…" value="${esc(cats[0]?.key || '')}"></div>
+      <datalist id="categoryList">${cats.map(c => `<option value="${esc(c.key)}">${esc(c.kind)}</option>`).join('')}</datalist>
+
+      <div class="fld"><label>Party</label>
+        <input name="party" id="partyField" list="partyList" autocomplete="off" placeholder="click to search…"></div>
       <datalist id="partyList">${S.opts.parties.map(p => `<option value="${esc(p.key)}">`).join('')}</datalist>
-      <div class="fld"><label>Property</label><select name="property_id">
-        <option value="">— none —</option>
-        ${(S.masters?.properties || []).map(p =>
-          `<option value="${p.property_id}">${esc(p.property_id)} · ${esc(p.name)}</option>`).join('')}
-      </select></div>
+
+      <div class="fld"><label>Property <button type="button" class="btn" id="addPropBtn"
+        style="padding:1px 7px;font-size:11px;margin-left:4px">+ add</button></label>
+        <input id="propField" list="propertyList" autocomplete="off" placeholder="click to search, or leave blank">
+        <input type="hidden" name="property_id" id="propHidden"></div>
+      <datalist id="propertyList">${props.map(p => `<option value="${esc(propLabel(p))}">`).join('')}</datalist>
+
+      <div class="fld full">
+        <label style="font-weight:normal;font-size:12.5px">
+          <input type="checkbox" id="multiPropToggle"> Split this entry evenly across several properties
+        </label>
+        <div id="multiPropList" style="display:none;max-height:170px;overflow:auto;
+          border:1px solid var(--line);border-radius:6px;padding:8px;margin-top:6px;columns:2">
+          ${props.map(p => `<label style="display:block;font-size:12px;margin:2px 0;break-inside:avoid">
+            <input type="checkbox" class="multiPropCk" value="${p.property_id}"> ${esc(propLabel(p))}</label>`).join('')}
+        </div>
+      </div>
+
       <div class="fld"><label>Paid by</label><select name="payment_mode">
         <option value="">—</option><option>Bank Transfer</option><option>UPI</option>
         <option>Cash</option><option>Cheque</option><option>Card</option></select></div>
@@ -1025,13 +1092,47 @@ V.entry = () => {
       <div class="full"><button class="btn pri" type="submit">Post entry</button>
         <span class="note" style="margin-left:10px">Saved as source <b>Manual</b> so it is never confused with Tally data.</span></div>
     </form>`)}</div>`;
+
+  const catField = $('#catField'), partyField = $('#partyField'), propField = $('#propField'), propHidden = $('#propHidden');
+  smartField(catField);
+  smartField(partyField);
+  smartField(propField, val => {
+    const m = props.find(p => propLabel(p) === val);
+    propHidden.value = m ? m.property_id : '';
+  });
+  $('#addCatBtn').onclick = () => createCategory(catField);
+  $('#addPropBtn').onclick = () => createProperty(propField);
+
+  const multiToggle = $('#multiPropToggle'), multiList = $('#multiPropList');
+  multiToggle.onchange = () => {
+    multiList.style.display = multiToggle.checked ? 'block' : 'none';
+    if (multiToggle.checked) { propField.value = ''; propHidden.value = ''; propField.disabled = true; }
+    else propField.disabled = false;
+  };
+
   $('#eForm').onsubmit = async ev => {
     ev.preventDefault();
     const b = Object.fromEntries(new FormData(ev.target).entries());
+    delete b.property_id; // re-derive below, either single or split
+    const multiIds = multiToggle.checked
+      ? [...v.querySelectorAll('.multiPropCk:checked')].map(c => c.value) : [];
     try {
-      await api('/api/txn/create', b);
-      toast('Entry posted'); ev.target.reset();
+      if (multiIds.length >= 2) {
+        const share = Math.round((Number(b.gross_amount) / multiIds.length) * 100) / 100;
+        const group = `SPLIT-${Date.now()}`;
+        for (let i = 0; i < multiIds.length; i++) {
+          await api('/api/txn/create', { ...b, gross_amount: share, property_id: multiIds[i],
+            voucher_no: b.voucher_no || group,
+            narration: `${b.narration || ''} (split ${i+1}/${multiIds.length} across properties)`.trim() });
+        }
+        toast(`Entry posted, split across ${multiIds.length} properties`);
+      } else {
+        await api('/api/txn/create', { ...b, property_id: propHidden.value || null });
+        toast('Entry posted');
+      }
+      ev.target.reset();
       $('#eForm [name=txn_date]').value = new Date().toISOString().slice(0,10);
+      multiList.style.display = 'none'; propField.disabled = false;
       refresh();
     } catch (e) { toast(e.message, true); }
   };
@@ -1701,7 +1802,7 @@ V.expenses = async () => {
           <td><b>${esc(h.name)}</b>${h.active ? '' : ' <span class="tag">off</span>'}</td>
           <td><span class="tag ${h.is_fixed ? 'tally' : 'flag'}">${h.is_fixed ? 'fixed' : 'variable'}</span></td>
           <td class="num">${h.fixed_amount != null ? money(h.fixed_amount, true) : '—'}</td>
-          <td>${esc(h.category || h.party || '<span style="color:var(--muted-2)">not linked</span>')}</td>
+          <td>${(h.category || h.party) ? esc(h.category || h.party) : '<span style="color:var(--muted-2)">not linked</span>'}</td>
           <td class="num">${h.actual != null ? money(h.actual, true) : '—'}</td>
           <td class="num ${h.variance > 0 ? 'out' : h.variance < 0 ? 'in' : ''}">${h.variance != null ? money(h.variance, true) : '—'}</td>
           <td class="num">${h.due_day ? h.due_day + 'th' : '—'}</td></tr>`).join('')}
